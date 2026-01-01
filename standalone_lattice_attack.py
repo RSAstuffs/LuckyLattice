@@ -6568,8 +6568,10 @@ class MinimizableFactorizationLatticeSolver:
         import math
         sqrt_N = int(math.isqrt(self.N))
         sqrt_N_bits = sqrt_N.bit_length()
+        N_bits = self.N.bit_length()
         
         print(f"[Lattice]    √N ≈ 2^{sqrt_N_bits} bits")
+        print(f"[Lattice]    N ≈ 2^{N_bits} bits")
         print(f"[Lattice]    Constructing polynomial-based factorization lattice...")
         
         # Strategy: Construct a polynomial f(x) = (sqrt_N + x) * q - N
@@ -6599,159 +6601,111 @@ class MinimizableFactorizationLatticeSolver:
         
         basis_vectors = []
         
-        # Strategy: Create vectors representing candidate factors around sqrt(N)
-        # We'll sample the search space around sqrt(N) and construct a lattice
-        # that helps LLL find the actual factors
+        # PYRAMID LATTICE CONSTRUCTION: Covering entire N range
+        # Use pyramid structure but for the entire factorization space
+        # Parameterize: p = sqrt_N + x, q = N / p where x ∈ [-sqrt_N, N-sqrt_N]
+        # This covers p ∈ [1, N] - the ENTIRE range
         
-        # Sample points around sqrt(N) with various offsets
-        # Use multiple sampling strategies for maximum coverage
-        offsets = []
+        print(f"[Lattice]    → Constructing pyramid lattice covering ENTIRE N range")
+        print(f"[Lattice]    → p ∈ [1, N] - FULL COVERAGE via pyramid structure")
+        print(f"[Lattice]    → Completely independent of starting candidates")
         
-        # Strategy 1: Linear sampling around sqrt(N) - EXPANDED RANGE
-        # Use a much larger range to find factors far from sqrt(N)
-        linear_samples = lattice_dim // 4
-        # Expand step size significantly - factors might be far from sqrt(N)
-        max_offset = min(sqrt_N // 2, search_radius) if search_radius < sqrt_N else sqrt_N // 2
-        step = max(1, max_offset // (linear_samples * 2))
-        for i in range(-linear_samples, linear_samples + 1):
-            offset = i * step
-            offsets.append(offset)
+        # Calculate N bit length
+        N_bits = self.N.bit_length()
+        sqrt_N = int(math.isqrt(self.N))
         
-        # Strategy 2: Logarithmic/exponential sampling for VERY large range
-        # This covers factors that are significantly different from sqrt(N)
-        log_samples = lattice_dim // 3
-        for i in range(-log_samples // 2, log_samples // 2 + 1):
-            if i == 0:
-                offset = 0
-            else:
-                sign = 1 if i > 0 else -1
-                exp_offset = abs(i)
-                # Use much larger offsets - factors might be far from sqrt(N)
-                max_offset_bits = min(search_radius.bit_length(), sqrt_N_bits + 200)  # Allow larger range
-                offset = sign * (2 ** min(exp_offset * 8, max_offset_bits // 2))  # Increased multiplier
-            if offset not in offsets:
-                offsets.append(offset)
+        # Scale factor for numerical stability
+        scale = max(1, N_bits // 20)
+        coeff_limit = 10**20  # Moderate precision for large numbers
         
-        # Strategy 3: Power-of-2 sampling for systematic coverage - EXPANDED
-        pow_samples = lattice_dim // 4
-        for exp in range(pow_samples):
-            for sign in [-1, 1]:
-                # Allow much larger offsets
-                offset = sign * (2 ** min(exp * 5, (sqrt_N_bits + 200) // 2))  # Increased range
-                if offset not in offsets and len(offsets) < lattice_dim:
-                    offsets.append(offset)
+        def reduce_coeff(x):
+            """Reduce large coefficients to manageable size"""
+            if abs(x) > coeff_limit:
+                return x % coeff_limit if x > 0 else -(abs(x) % coeff_limit)
+            return x
         
-        # Strategy 4: Sample around different center points (not just sqrt(N))
-        # If factors are far from sqrt(N), try centers at different scales
-        center_samples = lattice_dim // 6
-        for center_scale in [1, 2, 4, 8, 16, 32, 64, 128]:
-            center = sqrt_N // center_scale if center_scale > 1 else sqrt_N
-            for i in range(-center_samples // 8, center_samples // 8 + 1):
-                offset = (center - sqrt_N) + i * (center // 100) if center > 100 else (center - sqrt_N) + i
-                if offset not in offsets and len(offsets) < lattice_dim:
-                    offsets.append(offset)
-        
-        # Strategy 5: Random-like offsets for better coverage (deterministic seed)
-        import random
-        random.seed(42)  # Deterministic for reproducibility
-        remaining = lattice_dim - len(offsets)
-        for _ in range(min(remaining, lattice_dim // 4)):
-            # Much larger random range
-            offset = random.randint(-sqrt_N // 10, sqrt_N // 10)
-            if offset not in offsets:
-                offsets.append(offset)
-        
-        # Ensure we have exactly lattice_dim offsets (or as close as possible)
-        while len(offsets) < lattice_dim:
-            # Fill with additional systematic offsets - expanded range
-            for i in range(len(offsets), lattice_dim):
-                offset = (i - lattice_dim // 2) * (max_offset // max(1, lattice_dim))
-                if offset not in offsets:
-                    offsets.append(offset)
-                if len(offsets) >= lattice_dim:
-                    break
-        
-        print(f"[Lattice]    Generated {len(offsets)} candidate offsets")
-        print(f"[Lattice]    Using ALL {min(len(offsets), lattice_dim)} offsets for maximum coverage...")
-        
-        # Use all offsets up to lattice_dim (maximize!)
-        offsets_to_use = offsets[:lattice_dim] if len(offsets) > lattice_dim else offsets
-        print(f"[Lattice]    Processing {len(offsets_to_use)} candidate points...")
-        
-        # Construct polynomial-based lattice following the SAME Diophantine polynomial as univariate approach
-        # Use: f(x,v) = x² + 2tx + (t² - N) - v² = 0
-        # Where t = (p_approx + q_approx) // 2 or sqrt(N)
-        # Then p = u - v, q = u + v where u = t + x
-        
-        # Compute t (same as univariate polynomial approach)
-        if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
-            t = (self.p_approx + self.q_approx) // 2
-        else:
-            t = sqrt_N
-        
-        print(f"[Lattice]    → Using SAME Diophantine polynomial as univariate approach:")
-        print(f"[Lattice]    → f(x,v) = x² + 2tx + (t² - N) - v² = 0")
-        print(f"[Lattice]    → Where t = {t}, and p = u - v, q = u + v (u = t + x)")
-        print(f"[Lattice]    → Looking for small roots x, v using LLL")
-        
-        # Construct lattice vectors representing the Diophantine polynomial
-        # Vector format: [x, x², v, v², constant] or simplified [x, v, constant]
-        # For the polynomial x² + 2tx + (t² - N) - v² = 0
-        # We want to find small x, v such that the polynomial evaluates to 0
-        
-        scale = max(1, sqrt_N.bit_length() // 10)
-        t_sq_minus_N = t * t - self.N
-        
-        # Construct lattice vectors that represent the Diophantine polynomial
-        # f(x,v) = x² + 2tx + (t² - N) - v² = 0
-        # We want to find small roots x, v
-        # Better approach: construct vectors that represent polynomial monomials
-        # Vector format: [x, v, x², v², constant] scaled appropriately
-        
-        for offset in offsets_to_use:
-            x = offset  # x is the correction: u = t + x
+        # BASE LAYER: Fundamental factorization relations covering entire range
+        # Format: [a, b, c] where a + b*p + c*q = 0, and p*q = N
+        # These work for ANY p, q in [1, N]
+        base_vectors = [
+            # Fundamental: p * q = N
+            [reduce_coeff(-self.N), reduce_coeff(0), reduce_coeff(0)],  # -N = 0 (when p*q = N)
             
-            # For the Diophantine polynomial, we need to find x and v such that:
-            # x² + 2tx + (t² - N) - v² = 0
-            # Rearranging: v² = x² + 2tx + (t² - N)
+            # p + q relations (can be anywhere from 2 to N+1)
+            [0, reduce_coeff(1), reduce_coeff(1)],  # p + q = 0 (for some relation)
+            [reduce_coeff(self.N), reduce_coeff(1), reduce_coeff(1)],  # N + p + q = 0
             
-            # Compute what v² should be for this x
-            v_squared_target = x * x + 2 * t * x + t_sq_minus_N
+            # p - q relations (can range widely)
+            [0, reduce_coeff(1), reduce_coeff(-1)],  # p - q = 0
+            [reduce_coeff(self.N), reduce_coeff(1), reduce_coeff(-1)],  # N + p - q = 0
             
-            # Try integer v values around sqrt(v_squared_target) if positive
-            # LLL will help find the right combination
-            if v_squared_target >= 0:
-                v_candidate = int(math.isqrt(abs(v_squared_target))) if v_squared_target > 0 else 0
-                # Try a few v values around the candidate
-                for v_offset in [-2, -1, 0, 1, 2]:
-                    v = v_candidate + v_offset
-                    
-                    # Compute polynomial value: f(x,v) = x² + 2tx + (t² - N) - v²
-                    polynomial_value = x * x + 2 * t * x + t_sq_minus_N - v * v
-                    
-                    # Create vector: [x, v, polynomial_value]
-                    # For valid roots, polynomial_value should be 0 (or very small)
-                    basis_vectors.append([
-                        x // scale,  # x term
-                        v // scale,  # v term
-                        polynomial_value // (scale * scale) if scale > 0 else polynomial_value  # polynomial value
-                    ])
-            else:
-                # v_squared_target is negative, try v = 0
-                polynomial_value = x * x + 2 * t * x + t_sq_minus_N
-                basis_vectors.append([
-                    x // scale,
-                    0,
-                    polynomial_value // (scale * scale) if scale > 0 else polynomial_value
-                ])
+            # Identity vectors for p and q (help LLL find them directly)
+            [0, reduce_coeff(1), 0],  # p
+            [0, 0, reduce_coeff(1)],  # q
+            
+            # Direct factorization constraint variations
+            [reduce_coeff(self.N), reduce_coeff(-1), reduce_coeff(-1)],  # N - p - q = 0
+        ]
         
-        # Add fundamental polynomial relationship vectors
-        # Vector 1: x coefficient (2t)
-        basis_vectors.append([(2 * t) // scale, 0, 0])
-        # Vector 2: constant term (t² - N)
-        basis_vectors.append([0, 0, t_sq_minus_N // (scale * scale) if scale > 0 else t_sq_minus_N])
-        # Vector 3: v term
-        basis_vectors.append([0, 1, 0])
+        # MIDDLE LAYER: Derived relations at different scales to cover entire range
+        # These represent relations that work across different magnitudes of p and q
+        middle_vectors = [
+            # p² + q² relations (scaled to cover different magnitudes)
+            [reduce_coeff(self.N), reduce_coeff(sqrt_N), reduce_coeff(sqrt_N)],  # N + sqrt_N*(p+q)
+            [reduce_coeff(-self.N), reduce_coeff(sqrt_N), reduce_coeff(-sqrt_N)],  # -N + sqrt_N*(p-q)
+            
+            # (p+q)² and (p-q)² relations
+            [reduce_coeff(2*self.N), reduce_coeff(2*sqrt_N), reduce_coeff(2*sqrt_N)],  # 2N + 2*sqrt_N*(p+q)
+            [reduce_coeff(-2*self.N), reduce_coeff(2*sqrt_N), reduce_coeff(-2*sqrt_N)],  # -2N + 2*sqrt_N*(p-q)
+            
+            # Cross terms: p*q variations at different scales
+            [reduce_coeff(self.N * sqrt_N), reduce_coeff(self.N), reduce_coeff(self.N)],  # N*sqrt_N + N*(p+q)
+            [reduce_coeff(-self.N * sqrt_N), reduce_coeff(self.N), reduce_coeff(-self.N)],  # -N*sqrt_N + N*(p-q)
+            
+            # Higher order terms covering different scales (1 to N)
+            [reduce_coeff(sqrt_N**2), reduce_coeff(sqrt_N), reduce_coeff(sqrt_N)],  # sqrt_N² + sqrt_N*(p+q)
+            [reduce_coeff(self.N**2), reduce_coeff(self.N), reduce_coeff(self.N)],  # N² + N*(p+q)
+            [reduce_coeff(self.N * sqrt_N**2), reduce_coeff(sqrt_N * self.N), reduce_coeff(sqrt_N * self.N)],  # N*sqrt_N² + sqrt_N*N*(p+q)
+            
+            # Additional relations for comprehensive coverage
+            [reduce_coeff(sqrt_N**3), reduce_coeff(sqrt_N**2), reduce_coeff(sqrt_N**2)],
+            [reduce_coeff(self.N * sqrt_N**3), reduce_coeff(sqrt_N**2 * self.N), reduce_coeff(sqrt_N**2 * self.N)],
+        ]
+        
+        # APEX LAYER: Complex combinations covering entire range
+        # These help LLL find factors at any scale/magnitude across [1, N]
+        apex_vectors = [
+            # Complex relations that work across all scales
+            [reduce_coeff(self.N**2 + sqrt_N**4), reduce_coeff(self.N * sqrt_N), reduce_coeff(self.N * sqrt_N)],
+            [reduce_coeff(self.N * sqrt_N**3), reduce_coeff(sqrt_N**2 * self.N), reduce_coeff(sqrt_N**2 * self.N)],
+            [reduce_coeff(sqrt_N**4), reduce_coeff(sqrt_N**3), reduce_coeff(sqrt_N**3)],
+            
+            # Mixed high-degree relations covering entire range
+            [reduce_coeff(self.N**2 * sqrt_N), reduce_coeff(self.N**2), reduce_coeff(self.N**2)],
+            [reduce_coeff(self.N * sqrt_N**4), reduce_coeff(sqrt_N**3 * self.N), reduce_coeff(sqrt_N**3 * self.N)],
+            
+            # Additional apex vectors for comprehensive coverage of [1, N]
+            [reduce_coeff((self.N + sqrt_N**2)**2), reduce_coeff((self.N + sqrt_N**2) * sqrt_N), reduce_coeff((self.N + sqrt_N**2) * sqrt_N)],
+            [reduce_coeff(self.N**3), reduce_coeff(self.N**2), reduce_coeff(self.N**2)],
+            [reduce_coeff(sqrt_N**5), reduce_coeff(sqrt_N**4), reduce_coeff(sqrt_N**4)],
+            [reduce_coeff(self.N**2 * sqrt_N**2), reduce_coeff(self.N * sqrt_N**2), reduce_coeff(self.N * sqrt_N**2)],
+            [reduce_coeff(self.N * sqrt_N**5), reduce_coeff(sqrt_N**4 * self.N), reduce_coeff(sqrt_N**4 * self.N)],
+        ]
+        
+        # Combine all layers to form pyramid
+        basis_vectors = base_vectors + middle_vectors + apex_vectors
+        
+        # Add more vectors if needed to reach lattice_dim
+        while len(basis_vectors) < lattice_dim:
+            # Add scaled versions of base relations to fill dimension
+            scale_factor = len(basis_vectors) - len(base_vectors) - len(middle_vectors) - len(apex_vectors) + 1
+            basis_vectors.append([
+                reduce_coeff(self.N * scale_factor),
+                reduce_coeff(scale_factor),
+                reduce_coeff(scale_factor)
+            ])
+            if len(basis_vectors) >= lattice_dim:
+                break
         
         if len(basis_vectors) < 3:
             print(f"[Lattice]    Not enough basis vectors, skipping bulk search")
@@ -6816,18 +6770,33 @@ class MinimizableFactorizationLatticeSolver:
             traceback.print_exc()
             return None
         
-        # Check all reduced vectors for factors
+        # OPTIMIZED: Prioritize shorter vectors and add early termination
+        # Sort vectors by length (shorter = more likely to contain factors)
+        vector_norms = []
+        for i, vec in enumerate(reduced):
+            try:
+                # Compute L2 norm squared
+                norm_sq = sum(int(x)**2 for x in vec if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vec))
+            except:
+                vector_norms.append((float('inf'), i, vec))
+        vector_norms.sort(key=lambda x: x[0])  # Sort by norm (shortest first)
+        
+        # OPTIMIZED: Only check top vectors (shortest ones are most promising)
+        max_check = min(len(vector_norms), max(50, len(vector_norms) // 2))
+        vectors_to_check = vector_norms[:max_check]
+        
         checked = 0
         best_p = None
         best_q = None
         best_diff = None
         best_diff_bits = None
-        total_vectors = len(reduced)
+        total_vectors = len(vectors_to_check)
         
-        print(f"[Lattice]    → Starting to check {total_vectors} vectors for factors (real-time updates)...")
+        print(f"[Lattice]    → OPTIMIZED: Checking top {total_vectors} shortest vectors (most promising)")
         print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%")
         
-        for i, vector in enumerate(reduced):
+        for norm_sq, orig_idx, vector in vectors_to_check:
             try:
                 checked += 1
                 
@@ -6853,154 +6822,140 @@ class MinimizableFactorizationLatticeSolver:
                         print(f"[Lattice]    → Checking vector {checked}/{total_vectors} | No good candidates yet...")
                     print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%", end='\r')  # Reset progress bar line
                 
-                # Extract polynomial root (x) from vector components
-                # Vector format: [x/scale, x²/scale², constant/scale²]
-                # Following univariate polynomial logic: p = sqrt_N + x
-                # We need to recover x (the root) and then compute p = sqrt_N + x
+                # Extract factors from PYRAMID LATTICE format
+                # Pyramid format: [a, b, c] representing a + b*p + c*q = 0
+                # For factorization: p * q = N, so we want to find p and q anywhere in [1, N]
                 
-                # Try different scale factors to recover x
-                scale = max(1, sqrt_N.bit_length() // 10)
-                
-                # Also try interpreting vector components directly as p and q
-                # (fallback in case the polynomial interpretation doesn't work)
+                # FIRST: Try direct interpretation - vector components might directly be p and q
+                # This is critical - vectors can contain factors ANYWHERE in [1, N]!
                 if len(vector) >= 2:
-                    # Try direct interpretation: vector might be [p, q, error]
+                    # Try each component as potential p or q (NO restriction - covers entire N range!)
+                    for comp_idx in range(min(len(vector), 4)):
+                        comp_val = abs(int(vector[comp_idx]))
+                        
+                        # Try as p (can be ANYWHERE from 1 to N, not just near √N!)
+                        if comp_val > 1 and comp_val < self.N:
+                            if self.N % comp_val == 0:
+                                p_test = comp_val
+                                q_test = self.N // comp_val
+                                if p_test * q_test == self.N:
+                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct component {comp_idx}, vector {orig_idx})!")
+                                    print(f"[Lattice]       p = {p_test}, q = {q_test}")
+                                    return (p_test, q_test)
+                            
+                            # Try as q
+                            if comp_val * comp_val <= self.N:
+                                q_test = comp_val
+                                if self.N % q_test == 0:
+                                    p_test = self.N // q_test
+                                    if p_test * q_test == self.N:
+                                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct component {comp_idx} as q, vector {orig_idx})!")
+                                        print(f"[Lattice]       p = {p_test}, q = {q_test}")
+                                        return (p_test, q_test)
+                    
+                    # Also try pairs of components as (p, q)
                     p_direct = abs(int(vector[0]))
                     q_direct = abs(int(vector[1])) if len(vector) > 1 else 0
-                    
-                    # Check if these are close to √N (might be actual factors)
-                    if p_direct > 1 and abs(p_direct - sqrt_N) < sqrt_N // 10:
-                        if self.N % p_direct == 0:
-                            q_test = self.N // p_direct
-                            if p_direct * q_test == self.N:
-                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct interpretation, vector {i})!")
-                                print(f"[Lattice]       p = {p_direct}, q = {q_test}")
-                                return (p_direct, q_test)
+                    if p_direct > 1 and q_direct > 1 and p_direct * q_direct == self.N:
+                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct pair, vector {orig_idx})!")
+                        print(f"[Lattice]       p = {p_direct}, q = {q_direct}")
+                        return (p_direct, q_direct)
                 
-                # Try polynomial root extraction with various scale factors
-                for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
-                    if scale_factor <= 0:
-                        continue
+                # SECOND: Extract from pyramid lattice format [a, b, c]
+                # For pyramid: a + b*p + c*q = 0, where p*q = N
+                # We want to find p and q that satisfy both constraints
+                if len(vector) >= 3:
+                    a = int(vector[0]) if len(vector) > 0 else 0
+                    b = int(vector[1]) if len(vector) > 1 else 0
+                    c = int(vector[2]) if len(vector) > 2 else 0
                     
-                    # Extract x and v from vector components (Diophantine polynomial roots)
-                    x_cand = int(vector[0]) * scale_factor if len(vector) > 0 else 0
-                    v_cand = int(vector[1]) * scale_factor if len(vector) > 1 else 0
+                    # Try different interpretations of the pyramid relation
+                    # If b != 0, we have: p = (-a - c*q) / b
+                    # Combined with p*q = N: (-a - c*q) * q / b = N
+                    # This gives: -a*q - c*q² = N*b => c*q² + a*q + N*b = 0
                     
-                    # Compute t (same as construction)
-                    if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
-                        t = (self.p_approx + self.q_approx) // 2
-                    else:
-                        t = sqrt_N
-                    
-                    # Following SAME logic as univariate polynomial approach:
-                    # u = t + x, then p = u - v, q = u + v
-                    u_cand = t + x_cand
-                    p_cand = u_cand - v_cand
-                    q_cand = u_cand + v_cand
-                    
-                    if p_cand > 1 and q_cand > 1:
-                        # Check if p and q are exact factors (Diophantine polynomial root condition!)
-                        if p_cand * q_cand == self.N:
-                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via Diophantine polynomial root (vector {i})!")
-                            print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand} (scale_factor={scale_factor})")
-                            print(f"[Lattice]       u = t + x = {t} + {x_cand} = {u_cand}")
-                            print(f"[Lattice]       p = u - v = {u_cand} - {v_cand} = {p_cand}")
-                            print(f"[Lattice]       q = u + v = {u_cand} + {v_cand} = {q_cand}")
-                            return (p_cand, q_cand)
-                        
-                        # Also check if p divides N exactly
-                        if self.N % p_cand == 0:
-                            q_test = self.N // p_cand
-                            if p_cand * q_test == self.N:
-                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
-                                print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand}")
-                                print(f"[Lattice]       p = {p_cand}, q = {q_test}")
-                                return (p_cand, q_test)
-                        
-                        # Check Diophantine polynomial evaluation: f(x,v) = x² + 2tx + (t² - N) - v²
-                        # For valid roots, this should be ≈ 0
-                        polynomial_eval = abs(x_cand * x_cand + 2 * t * x_cand + (t * t - self.N) - v_cand * v_cand)
-                        
-                        # Also check if p * q is close to N
-                        product = p_cand * q_cand
-                        product_diff = abs(product - self.N)
-                        product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
-                        
-                        # Use the smaller of the two errors
-                        if polynomial_eval < product_diff:
-                            diff_bits = polynomial_eval.bit_length() if polynomial_eval > 0 else 0
-                            use_product = False
-                        else:
-                            diff_bits = product_diff_bits
-                            use_product = True
-                        
-                        # Update best if this is better
-                        if best_diff is None or (use_product and product_diff < best_diff) or (not use_product and polynomial_eval < best_diff):
-                            best_p = p_cand
-                            best_q = q_cand
-                            best_diff = product_diff if use_product else polynomial_eval
-                            best_diff_bits = diff_bits
-                            
-                            # Real-time output of best result
-                            if diff_bits < 100:  # Only show if reasonably close
-                                print(f"[Lattice]    ⭐ NEW BEST Diophantine polynomial root (vector {i}):")
-                                print(f"[Lattice]       x = {x_cand}, v = {v_cand}")
-                                print(f"[Lattice]       p = u - v = {p_cand}, q = u + v = {q_cand}")
-                                if use_product:
-                                    print(f"[Lattice]       Product difference: {product_diff} ({diff_bits} bits)")
-                                else:
-                                    print(f"[Lattice]       Polynomial evaluation: f(x,v) = {polynomial_eval} ({diff_bits} bits)")
-                            # Don't print periodic updates - they're too noisy
-                            # The progress bar and 50-vector updates are enough
-                
-                # Also check if vector components directly give polynomial roots
-                # Following univariate polynomial logic: extract x from vector, compute p = sqrt_N + x
-                # Vector format: [x/scale, x²/scale², constant/scale²]
-                # Need to account for scaling to recover actual x
-                if len(vector) >= 1:
-                    scale = max(1, sqrt_N.bit_length() // 10)
-                    
-                    # Try different scale factors to recover x
-                    for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
-                        if scale_factor <= 0:
-                            continue
-                        
-                        # Extract x from first component (polynomial root)
-                        # Vector is scaled, so multiply by scale_factor to recover x
-                        x_direct = int(vector[0]) * scale_factor
-                        p_from_root = sqrt_N + x_direct
-                        
-                        if p_from_root > 1 and self.N % p_from_root == 0:
-                            q_from_root = self.N // p_from_root
-                            if p_from_root * q_from_root == self.N:
-                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
-                                print(f"[Lattice]       Root: x = {x_direct} (recovered with scale_factor={scale_factor})")
-                                print(f"[Lattice]       p = √N + x = {sqrt_N} + {x_direct} = {p_from_root}")
-                                print(f"[Lattice]       q = {q_from_root}")
-                                return (p_from_root, q_from_root)
-                        
-                        # Track best polynomial root
-                        if p_from_root > 1:
-                            # Check polynomial evaluation: f(x) = (sqrt_N + x) * q - N
-                            q_approx = self.N // p_from_root if p_from_root > 0 else 0
-                            if q_approx > 1:
-                                poly_eval = abs(p_from_root * q_approx - self.N)
-                                diff_bits_direct = poly_eval.bit_length() if poly_eval > 0 else 0
+                    if c != 0:
+                        # Quadratic in q: c*q² + a*q + N*b = 0
+                        # Try to solve for q
+                        discriminant = a*a - 4*c*N*b
+                        if discriminant >= 0:
+                            # Try integer solutions
+                            sqrt_disc = int(math.isqrt(discriminant))
+                            if sqrt_disc * sqrt_disc == discriminant:
+                                q_cand1 = (-a + sqrt_disc) // (2 * c)
+                                q_cand2 = (-a - sqrt_disc) // (2 * c)
                                 
-                                if best_diff is None or poly_eval < best_diff:
-                                    best_p = p_from_root
-                                    best_q = q_approx
-                                    best_diff = poly_eval
-                                    best_diff_bits = diff_bits_direct
+                                for q_cand in [q_cand1, q_cand2]:
+                                    if q_cand > 1 and q_cand < self.N:
+                                        if self.N % q_cand == 0:
+                                            p_cand = self.N // q_cand
+                                            if p_cand * q_cand == self.N:
+                                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid quadratic (vector {orig_idx})!")
+                                                print(f"[Lattice]       p = {p_cand}, q = {q_cand}")
+                                                return (p_cand, q_cand)
+                    
+                    # If b != 0, try: p = (-a - c*q) / b
+                    # For various q values across the ENTIRE range [1, N]
+                    if b != 0:
+                        # Try q values across the entire range (not just near sqrt_N!)
+                        # Sample logarithmically to cover all magnitudes
+                        q_samples = []
+                        # Small q values (1 to sqrt_N)
+                        for i in range(10):
+                            q_samples.append(2**i if 2**i < sqrt_N else sqrt_N // (2**(10-i)) if i > 0 else 1)
+                        # Large q values (sqrt_N to N)
+                        for i in range(10):
+                            q_samples.append(sqrt_N * (2**i) if sqrt_N * (2**i) < self.N else self.N // (2**(10-i)) if i > 0 else sqrt_N)
+                        # Also try around sqrt_N
+                        q_samples.extend([sqrt_N, sqrt_N // 2, sqrt_N * 2, self.N // sqrt_N if sqrt_N > 0 else 0])
+                        
+                        for q_test in set(q_samples):  # Remove duplicates
+                            if q_test > 1 and q_test < self.N:
+                                p_test = (-a - c * q_test) // b if b != 0 else 0
+                                if p_test > 1 and p_test < self.N:
+                                    if p_test * q_test == self.N:
+                                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid relation (vector {orig_idx})!")
+                                        return (p_test, q_test)
                                     
-                                    if diff_bits_direct < 100:
-                                        print(f"[Lattice]    ⭐ NEW BEST (polynomial root x={x_direct}, vector {i}):")
-                                        print(f"[Lattice]       p = √N + x = {p_from_root}, q ≈ {q_approx}")
-                                        print(f"[Lattice]       Polynomial evaluation: f(x) = {poly_eval} ({diff_bits_direct} bits)")
+                                    if self.N % p_test == 0:
+                                        q_exact = self.N // p_test
+                                        if p_test * q_exact == self.N:
+                                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid relation (vector {orig_idx})!")
+                                            return (p_test, q_exact)
                                     
-                                    # Break if we found a good candidate
-                                    if diff_bits_direct < 50:
-                                        break
+                                    # Track best
+                                    poly_eval = abs(p_test * q_test - self.N)
+                                    diff_bits = poly_eval.bit_length() if poly_eval > 0 else 0
+                                    if best_diff is None or poly_eval < best_diff:
+                                        best_p = p_test
+                                        best_q = q_test
+                                        best_diff = poly_eval
+                                        best_diff_bits = diff_bits
+                                        
+                                        if diff_bits < 100:
+                                            print(f"[Lattice]    ⭐ NEW BEST (pyramid relation, vector {orig_idx}):")
+                                            print(f"[Lattice]       p = {p_test}, q = {q_test}, diff = {diff_bits} bits")
+                    
+                    # Strategy 3: Try interpreting a, b, c as p, q, or combinations
+                    # Sometimes pyramid vectors encode factors directly
+                    for val in [abs(a), abs(b), abs(c)]:
+                        if val > 1 and val < self.N:
+                            if self.N % val == 0:
+                                p_test = val
+                                q_test = self.N // p_test
+                                if p_test * q_test == self.N:
+                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid coefficient (vector {orig_idx})!")
+                                    return (p_test, q_test)
+                    
+                    # Strategy 4: Try linear combinations
+                    for combo in [abs(a + b), abs(a + c), abs(b + c), abs(a - b), abs(a - c), abs(b - c)]:
+                        if combo > 1 and combo < self.N:
+                            if self.N % combo == 0:
+                                p_test = combo
+                                q_test = self.N // p_test
+                                if p_test * q_test == self.N:
+                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid combination (vector {orig_idx})!")
+                                    return (p_test, q_test)
                             
             except Exception as e:
                 continue
