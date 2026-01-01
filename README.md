@@ -244,6 +244,117 @@ MIT
 - Gröbner Bases: Cox, D., Little, J., & O'Shea, D. (2015). Ideals, Varieties, and Algorithms.
 - Factorization: Crandall, R., & Pomerance, C. (2005). Prime Numbers: A Computational Perspective.
 
+### Comparison with Coppersmith's Method
+
+LuckyLattice differs significantly from Coppersmith's attack in several key ways:
+
+| Aspect | Coppersmith's Method | LuckyLattice |
+|--------|---------------------|--------------|
+| **Domain** | Works modulo N (or divisors of N) | Works over integers (no modular constraint) |
+| **Root Size** | Requires roots < N^(1/d) where d is polynomial degree | Can find larger corrections with approximate factors |
+| **Lattice Structure** | Specific construction for small roots mod N | Pyramid-shaped lattice for factorization relations |
+| **Input Requirements** | Partial information (e.g., MSB/LSB of factors) | Approximate factors (p_approx, q_approx) |
+| **Polynomial Approach** | Direct LLL on constructed lattice | Gröbner basis elimination + direct solving |
+| **Method** | Finds small integer solutions to f(x) ≡ 0 (mod N) | Solves Diophantine equation f(x,v) = 0 over integers |
+| **Use Case** | RSA with partial key exposure | Factorization with approximate knowledge |
+
+**Key Differences:**
+
+1. **Modular vs. Integer Arithmetic**
+   - **Coppersmith**: Finds solutions to f(x) ≡ 0 (mod N), requiring roots to be small relative to N
+   - **LuckyLattice**: Solves f(x,v) = 0 over integers, allowing larger corrections when approximate factors are known
+
+2. **Lattice Construction**
+   - **Coppersmith**: Constructs a specific lattice from polynomial powers (x, x², ..., x^m) and N powers
+   - **LuckyLattice**: Uses a pyramid-shaped lattice representing factorization relations (p, q, p*q-N, p+q, p-q, etc.)
+
+3. **Polynomial Solving**
+   - **Coppersmith**: Uses LLL to find short vectors that correspond to small roots
+   - **LuckyLattice**: Uses Gröbner basis elimination to obtain univariate polynomials, then solves directly
+
+4. **Correction Size**
+   - **Coppersmith**: Limited by N^(1/d) bound - roots must be very small
+   - **LuckyLattice**: Can handle corrections up to 2^2000 with good approximations
+
+5. **When Each Works Best**
+   - **Coppersmith**: Best when you know partial bits (e.g., half the bits of p or q)
+   - **LuckyLattice**: Best when you have approximate values (e.g., p ≈ p_approx with small error)
+
+**Example Scenario:**
+
+For an RSA modulus N = p·q:
+- **Coppersmith**: If you know the top 50% of bits of p, it can recover the rest
+- **LuckyLattice**: If you know p ≈ p_approx (within search radius), it can find exact p and q
+
+### 1. Lattice-Based Method
+
+The `MinimizableFactorizationLatticeSolver` constructs a pyramid-shaped lattice basis representing factorization relations. It uses LLL reduction to find short vectors that correspond to optimal corrections to approximate factors.
+
+**Key Features:**
+- Pyramid lattice structure for large numbers
+- Integer-based LLL reduction (no float overflow)
+- Configurable search radius up to 2^2000
+
+### 2. Polynomial Methods
+
+The `EnhancedPolynomialSolver` uses multiple algebraic techniques:
+
+#### Gröbner Basis Elimination
+- Uses lexicographic ordering to eliminate variables
+- Constructs univariate polynomials in target variables
+- Solves for integer roots directly
+
+#### Resultant Elimination
+- Optimized for ABCD fused polynomials
+- Efficiently eliminates variables through resultants
+
+#### Hensel Lifting
+- Lifts modular solutions to full integers
+- Works with modular constraints
+
+#### Modular Constraints & Trial Division
+- Uses modular arithmetic to constrain solutions
+- Efficient trial division for small factors
+
+### 3. Integer-Based LLL
+
+The `fpylll_wrapper.py` module provides an integer-based LLL implementation that:
+- Uses Python's arbitrary-precision integers
+- Avoids float conversion errors for large numbers
+- Provides fpylll-compatible interface
+- Handles numbers with 2048+ bits
+
+## Architecture 🏗️
+
+```
+LuckyLattice/
+├── standalone_lattice_attack.py    # Main script with all solvers
+├── fpylll_wrapper.py               # Integer-based LLL implementation
+└── README.md                        # This file
+```
+
+### Main Classes
+
+- **`MinimizableFactorizationLatticeSolver`**: Lattice-based factorization using LLL reduction
+- **`EnhancedPolynomialSolver`**: Polynomial solving methods (Gröbner, resultants, Hensel)
+- **`IntegerMatrix`**: Matrix class for large integers
+- **`LLL`**: Integer-based LLL reduction function
+
+## Performance Considerations ⚡
+
+- **Small numbers (< 100 bits)**: Polynomial methods are fast and efficient
+- **Medium numbers (100-1000 bits)**: Lattice method works well with good approximations
+- **Large numbers (1000+ bits)**: Requires approximate factors and larger search radius
+- **Very large numbers (2048+ bits)**: Use `--ultra-search-radius` and integer-based LLL
+
+### Tips for Best Performance
+
+1. Provide the best possible approximate `p` and `q` values
+2. Use `--polynomial` flag for numbers < 500 bits
+3. Increase `--search-radius` for larger numbers
+4. Use `--verbose` to monitor progress
+5. For huge numbers, consider using `--ultra-search-radius`
+
 ---
 
 **Note**: This tool is for educational and research purposes. Do not use for illegal activities.
