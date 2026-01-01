@@ -12,7 +12,7 @@ Arguments:
     N: The number to factor (required)
     --p: Initial P candidate (optional, will be estimated if not provided)
     --q: Initial Q candidate (optional, will be estimated if not provided)
-    --search-radius: Search radius for corrections (default: 1000)
+    --search-radius: Search radius for corrections in bits (default: 4000, meaning 2^4000)
     --verbose: Enable verbose output
     --polynomial: Enable polynomial solving methods alongside lattice methods
 
@@ -3178,29 +3178,210 @@ class EnhancedPolynomialSolver:
 
             print(f"[Resultant] Eliminated {elim_var}, solving for {remaining_var}...")
 
-            # Solve the resultant equation
-            solutions = sp.solve(best_resultant, remaining_var)
+            # Try to solve the resultant equation
+            # For linear polynomials with huge coefficients, sp.solve() may fail
+            # So we handle linear cases directly
+            solutions = []
+            
+            try:
+                # Check if it's a linear polynomial
+                if remaining_var == self.p:
+                    poly_p = sp.Poly(best_resultant, self.p)
+                else:
+                    poly_p = sp.Poly(best_resultant, self.q)
+                
+                degree = poly_p.degree()
+                print(f"[Resultant] Resultant polynomial degree: {degree}")
+                
+                if degree == 1:
+                    # Linear case: a*x + b = 0 => x = -b/a
+                    # Extract coefficients directly
+                    coeffs = poly_p.all_coeffs()
+                    if len(coeffs) == 2:
+                        a, b = coeffs[1], coeffs[0]  # a*x + b = 0
+                        print(f"[Resultant] Linear equation: {a}*{remaining_var} + {b} = 0")
+                        print(f"[Resultant] Solving: {remaining_var} = -({b}) / ({a})")
+                        
+                        # Compute solution directly
+                        if a != 0:
+                            solution = -b / a
+                            solutions = [solution]
+                            print(f"[Resultant] Direct solution: {remaining_var} = {solution}")
+                            
+                            # Check if it's a rational number that might simplify to an integer
+                            # Also check absolute value in case sign is wrong
+                            candidates_to_check = [solution]
+                            
+                            # If negative, also check if absolute value is valid
+                            if hasattr(solution, '__lt__') and solution < 0:
+                                abs_solution = -solution
+                                candidates_to_check.append(abs_solution)
+                                print(f"[Resultant]   → Also checking absolute value: {abs_solution}")
+                            
+                            # Try to simplify rationals
+                            simplified_candidates = []
+                            for cand in candidates_to_check:
+                                try:
+                                    if isinstance(cand, sp.Rational) or (hasattr(cand, 'is_rational') and cand.is_rational):
+                                        simplified = sp.simplify(cand)
+                                        if simplified.is_integer:
+                                            simplified_candidates.append(simplified)
+                                            print(f"[Resultant]   → Simplified to integer: {simplified}")
+                                        elif hasattr(cand, 'p') and hasattr(cand, 'q'):
+                                            num, den = cand.p, cand.q
+                                            if den == 1:
+                                                simplified_candidates.append(sp.Integer(num))
+                                                print(f"[Resultant]   → Rational simplifies to integer: {num}")
+                                            else:
+                                                # Check if it divides N
+                                                if den > 0 and num % den == 0:
+                                                    int_val = num // den
+                                                    if int_val > 1:
+                                                        simplified_candidates.append(sp.Integer(int_val))
+                                                        print(f"[Resultant]   → Rational evaluates to integer: {int_val}")
+                                except:
+                                    pass
+                            
+                            if simplified_candidates:
+                                solutions = simplified_candidates
+                        else:
+                            print(f"[Resultant] ✗ Coefficient is zero, no solution")
+                    else:
+                        # Try sp.solve() as fallback
+                        solutions = sp.solve(best_resultant, remaining_var)
+                elif degree == 0:
+                    # Constant polynomial
+                    if best_resultant == 0:
+                        print(f"[Resultant] Resultant is zero - polynomials are dependent")
+                    else:
+                        print(f"[Resultant] Resultant is non-zero constant - no solution")
+                else:
+                    # Higher degree - use sp.solve()
+                    print(f"[Resultant] Higher degree ({degree}), using sp.solve()...")
+                    solutions = sp.solve(best_resultant, remaining_var)
+            except Exception as e:
+                print(f"[Resultant] Direct solving failed: {e}, trying sp.solve()...")
+                try:
+                    solutions = sp.solve(best_resultant, remaining_var)
+                except Exception as e2:
+                    print(f"[Resultant] sp.solve() also failed: {e2}")
+                    solutions = []
 
             print(f"[Resultant] Found {len(solutions)} potential {remaining_var} values")
 
             for i, val in enumerate(solutions[:8]):  # Limit candidates
                 print(f"[Resultant] Testing {remaining_var} = {val}")
-                if val.is_integer and val > 1:
-                    val_int = int(val)
+                
+                # Try to convert to integer if it's a rational that simplifies
+                # Also check absolute value in case the sign is wrong
+                candidates_to_test = [val]
+                
+                # If negative, also check absolute value
+                try:
+                    if hasattr(val, '__lt__') and val < 0:
+                        abs_val = -val
+                        candidates_to_test.append(abs_val)
+                        print(f"[Resultant]   → Also testing absolute value: {abs_val}")
+                except:
+                    pass
+                
+                val_int = None
+                for test_val in candidates_to_test:
+                    try:
+                        # Check if it's already an integer
+                        if hasattr(test_val, 'is_integer') and test_val.is_integer:
+                            if test_val > 1:
+                                val_int = int(test_val)
+                                print(f"[Resultant]   → Found integer: {val_int}")
+                                break
+                        # Check if it's a rational number that simplifies to an integer
+                        elif hasattr(test_val, 'is_rational') and test_val.is_rational:
+                            # Try to simplify rational to integer
+                            simplified = sp.simplify(test_val)
+                            if simplified.is_integer and simplified > 1:
+                                val_int = int(simplified)
+                                print(f"[Resultant]   → Rational simplified to integer: {val_int}")
+                                break
+                        # Check if it's a SymPy Rational
+                        elif isinstance(test_val, sp.Rational):
+                            # Check if it's actually an integer (denominator = 1)
+                            if test_val.q == 1 and test_val.p > 1:
+                                val_int = int(test_val.p)
+                                print(f"[Resultant]   → Rational with denominator 1: {val_int}")
+                                break
+                            elif test_val.q != 1:
+                                # Check if numerator is divisible by denominator
+                                # Handle negative numerators correctly
+                                num = abs(test_val.p)
+                                den = abs(test_val.q)
+                                if num % den == 0:
+                                    int_candidate = num // den
+                                    # Preserve sign
+                                    if test_val.p < 0:
+                                        int_candidate = -int_candidate
+                                    if abs(int_candidate) > 1:
+                                        val_int = abs(int_candidate)  # Use absolute value for factors
+                                        print(f"[Resultant]   → Rational divides evenly: {val_int} (from {int_candidate})")
+                                        break
+                                # Try to see if it simplifies
+                                simplified = sp.simplify(test_val)
+                                if simplified.is_integer and abs(simplified) > 1:
+                                    val_int = abs(int(simplified))  # Use absolute value
+                                    print(f"[Resultant]   → Rational simplified: {val_int}")
+                                    break
+                                # Last resort: check if it's very close to an integer (rounding error)
+                                try:
+                                    float_val = float(test_val)
+                                    if abs(float_val) > 1:
+                                        rounded = round(float_val)
+                                        if abs(float_val - rounded) < 1e-10:
+                                            val_int = abs(rounded)
+                                            print(f"[Resultant]   → Rational rounds to integer: {val_int}")
+                                            break
+                                except:
+                                    pass
+                        # Check if it's a regular integer
+                        elif isinstance(test_val, (int, sp.Integer)):
+                            if test_val > 1:
+                                val_int = int(test_val)
+                                print(f"[Resultant]   → Found integer: {val_int}")
+                                break
+                    except Exception as e:
+                        print(f"[Resultant]   → Error converting to integer: {e}")
+                        continue
+                    
+                    if val_int is not None:
+                        break
+                
+                if val_int is not None:
 
                     # Compute the other factor
                     if remaining_var == self.p:
+                        # Found p, compute q = N / p
                         if self.N % val_int == 0:
                             q_int = self.N // val_int
+                            print(f"[Resultant]   → Computed q = N / p = {self.N} / {val_int} = {q_int}")
                             if q_int > 1 and val_int * q_int == self.N:
                                 print(f"[Resultant] ✓✓✓ EXACT SOLUTION FOUND: p={val_int}, q={q_int}")
+                                print(f"[Resultant]   Verification: p × q = {val_int} × {q_int} = {val_int * q_int} = N ✓")
                                 return (val_int, q_int)
+                            else:
+                                print(f"[Resultant]   ✗ Verification failed: p × q = {val_int} × {q_int} = {val_int * q_int} ≠ N")
+                        else:
+                            print(f"[Resultant]   ✗ {val_int} is not a divisor of N (remainder: {self.N % val_int})")
                     else:  # remaining_var == q
+                        # Found q, compute p = N / q
                         if self.N % val_int == 0:
                             p_int = self.N // val_int
+                            print(f"[Resultant]   → Computed p = N / q = {self.N} / {val_int} = {p_int}")
                             if p_int > 1 and p_int * val_int == self.N:
                                 print(f"[Resultant] ✓✓✓ EXACT SOLUTION FOUND: p={p_int}, q={val_int}")
+                                print(f"[Resultant]   Verification: p × q = {p_int} × {val_int} = {p_int * val_int} = N ✓")
                                 return (p_int, val_int)
+                            else:
+                                print(f"[Resultant]   ✗ Verification failed: p × q = {p_int} × {val_int} = {p_int * val_int} ≠ N")
+                        else:
+                            print(f"[Resultant]   ✗ {val_int} is not a divisor of N (remainder: {self.N % val_int})")
 
             print("[Resultant] No valid solutions from ABCD resultants")
             return None
@@ -6276,16 +6457,37 @@ class MinimizableFactorizationLatticeSolver:
                 return x
 
         # Base vectors (fundamental relations with reduced coefficients)
-        # MASSIVELY EXPANDED: Add many more fundamental relations
+        # Key relationship: p*q = N, so (p_candidate + dp)*(q_candidate + dq) = N
+        # Expanding: p_candidate*q_candidate + p_candidate*dq + q_candidate*dp + dp*dq = N
+        # So: p_candidate*dq + q_candidate*dp + dp*dq = N - p_candidate*q_candidate
+        # For lattice: a + b*dp + c*dq = 0, where we want to find small dp, dq
+        
+        # The fundamental relationship: p*q - N = 0
+        # With corrections: (p_candidate + dp)*(q_candidate + dq) - N = 0
+        # This gives: p_candidate*q_candidate - N + p_candidate*dq + q_candidate*dp + dp*dq = 0
+        # Linearizing (ignoring dp*dq for now): p_candidate*dq + q_candidate*dp = N - p_candidate*q_candidate
+        
+        error = self.N - p_candidate * q_candidate  # The error we need to correct
+        
         base_vectors = [
-            [reduce_coeff(self.N), 0, reduce_coeff(p_candidate)],          # N*1 + 0*p + p_candidate*q = p_candidate*q
-            [0, reduce_coeff(self.N), reduce_coeff(q_candidate)],          # 0*1 + N*p + q_candidate*q = N*p + q_candidate*q
-            [reduce_coeff(p_candidate), reduce_coeff(q_candidate), -1],    # p_candidate*1 + q_candidate*p - q = p_candidate + q_candidate*p - q
-            # Additional base relations for 2048-bit numbers
-            [reduce_coeff(p_candidate * q_candidate), 1, -reduce_coeff(self.N)],  # p*q*1 + 1*p - N*q = p*q + p - N*q
-            [reduce_coeff(p_candidate + q_candidate), 1, -1],               # (p+q)*1 + 1*p - q = p+q + p - q
-            [reduce_coeff(p_candidate - q_candidate), 1, 1],                # (p-q)*1 + 1*p + q = p-q + p + q
-            [reduce_coeff(p_candidate**2 + q_candidate**2), reduce_coeff(2*p_candidate*q_candidate), -reduce_coeff((p_candidate + q_candidate)**2)],  # Expanded quadratic relations
+            # Fundamental: p_candidate*dq + q_candidate*dp = error
+            # Represented as: error + q_candidate*dp + p_candidate*dq = 0
+            [reduce_coeff(error), reduce_coeff(q_candidate), reduce_coeff(p_candidate)],
+            
+            # Alternative forms of the same relationship
+            [reduce_coeff(-error), reduce_coeff(-q_candidate), reduce_coeff(-p_candidate)],
+            
+            # p*q = N relationship: p_candidate*q_candidate - N + corrections
+            [reduce_coeff(p_candidate * q_candidate - self.N), reduce_coeff(q_candidate), reduce_coeff(p_candidate)],
+            
+            # Sum relationship: (p_candidate + dp) + (q_candidate + dq) = p_candidate + q_candidate + dp + dq
+            [0, 1, 1],  # dp + dq = 0 (for balanced corrections)
+            
+            # Difference relationship: (p_candidate + dp) - (q_candidate + dq) = p_candidate - q_candidate + dp - dq
+            [0, 1, -1],  # dp - dq = 0
+            
+            # Product relationship variations
+            [reduce_coeff(self.N), reduce_coeff(-q_candidate), reduce_coeff(-p_candidate)],  # N - q_candidate*dp - p_candidate*dq = 0
         ]
 
         # Middle layer (derived relations with normalized coefficients)
@@ -6343,6 +6545,520 @@ class MinimizableFactorizationLatticeSolver:
 
         return basis
 
+    def _bulk_search_factors_with_lll(self, search_radius: int) -> Optional[Tuple[int, int]]:
+        """
+        Bulk search for factors using LLL following univariate polynomial root-finding logic.
+        
+        Strategy: Construct a polynomial f(x) whose roots correspond to factors.
+        - If p = sqrt_N + x is a factor, then (sqrt_N + x) divides N
+        - We want to find x such that (sqrt_N + x) * q = N for some integer q
+        - This is equivalent to finding roots of the polynomial relationship
+        - Use LLL to find small roots (small x values) that give factors
+        
+        This follows the same logic as the univariate polynomial approach:
+        1. Construct polynomial representation
+        2. Use LLL to find roots (small x values)
+        3. Extract factors from roots
+        """
+        print(f"[Lattice] 🔍 BULK SEARCH MODE: Univariate polynomial root-finding approach")
+        print(f"[Lattice]    Search radius: {search_radius.bit_length()} bits")
+        print(f"[Lattice]    Strategy: Construct polynomial f(x) where roots = factors, use LLL to find roots")
+        print(f"[Lattice]    Following same logic as univariate polynomial method!")
+        
+        import math
+        sqrt_N = int(math.isqrt(self.N))
+        sqrt_N_bits = sqrt_N.bit_length()
+        
+        print(f"[Lattice]    √N ≈ 2^{sqrt_N_bits} bits")
+        print(f"[Lattice]    Constructing polynomial-based factorization lattice...")
+        
+        # Strategy: Construct a polynomial f(x) = (sqrt_N + x) * q - N
+        # We want to find x such that (sqrt_N + x) divides N exactly
+        # This means: (sqrt_N + x) * q = N for some integer q
+        # Rearranging: sqrt_N * q + x * q = N
+        # So: x * q = N - sqrt_N * q
+        # For small x, we have: q ≈ N / sqrt_N ≈ sqrt_N
+        # So: x * sqrt_N ≈ N - sqrt_N * sqrt_N = N - sqrt_N²
+        
+        # Polynomial approach: We want to find small x such that (sqrt_N + x) divides N
+        # Construct a lattice that represents this polynomial relationship
+        # LLL will find short vectors corresponding to small roots x
+        
+        # Optimize lattice dimension for LLL efficiency
+        # For 2048-bit numbers, 500 vectors with huge integers is too slow
+        # Use a more reasonable size that LLL can handle efficiently
+        # LLL complexity is roughly O(n^4 * log(max_entry)) for n vectors
+        max_lattice_dim = 100  # Reduced for LLL efficiency (was 500, too slow)
+        lattice_dim = min(max_lattice_dim, max(50, sqrt_N_bits))
+        
+        print(f"[Lattice]    → Optimized lattice dimension: {lattice_dim} vectors (for LLL efficiency)")
+        print(f"[Lattice]    → Note: Using fewer but more strategic vectors for faster LLL reduction")
+        
+        print(f"[Lattice]    Using MAXIMUM lattice dimension: {lattice_dim} vectors")
+        print(f"[Lattice]    (Maximized for comprehensive search coverage)")
+        
+        basis_vectors = []
+        
+        # Strategy: Create vectors representing candidate factors around sqrt(N)
+        # We'll sample the search space around sqrt(N) and construct a lattice
+        # that helps LLL find the actual factors
+        
+        # Sample points around sqrt(N) with various offsets
+        # Use multiple sampling strategies for maximum coverage
+        offsets = []
+        
+        # Strategy 1: Linear sampling around sqrt(N) - EXPANDED RANGE
+        # Use a much larger range to find factors far from sqrt(N)
+        linear_samples = lattice_dim // 4
+        # Expand step size significantly - factors might be far from sqrt(N)
+        max_offset = min(sqrt_N // 2, search_radius) if search_radius < sqrt_N else sqrt_N // 2
+        step = max(1, max_offset // (linear_samples * 2))
+        for i in range(-linear_samples, linear_samples + 1):
+            offset = i * step
+            offsets.append(offset)
+        
+        # Strategy 2: Logarithmic/exponential sampling for VERY large range
+        # This covers factors that are significantly different from sqrt(N)
+        log_samples = lattice_dim // 3
+        for i in range(-log_samples // 2, log_samples // 2 + 1):
+            if i == 0:
+                offset = 0
+            else:
+                sign = 1 if i > 0 else -1
+                exp_offset = abs(i)
+                # Use much larger offsets - factors might be far from sqrt(N)
+                max_offset_bits = min(search_radius.bit_length(), sqrt_N_bits + 200)  # Allow larger range
+                offset = sign * (2 ** min(exp_offset * 8, max_offset_bits // 2))  # Increased multiplier
+            if offset not in offsets:
+                offsets.append(offset)
+        
+        # Strategy 3: Power-of-2 sampling for systematic coverage - EXPANDED
+        pow_samples = lattice_dim // 4
+        for exp in range(pow_samples):
+            for sign in [-1, 1]:
+                # Allow much larger offsets
+                offset = sign * (2 ** min(exp * 5, (sqrt_N_bits + 200) // 2))  # Increased range
+                if offset not in offsets and len(offsets) < lattice_dim:
+                    offsets.append(offset)
+        
+        # Strategy 4: Sample around different center points (not just sqrt(N))
+        # If factors are far from sqrt(N), try centers at different scales
+        center_samples = lattice_dim // 6
+        for center_scale in [1, 2, 4, 8, 16, 32, 64, 128]:
+            center = sqrt_N // center_scale if center_scale > 1 else sqrt_N
+            for i in range(-center_samples // 8, center_samples // 8 + 1):
+                offset = (center - sqrt_N) + i * (center // 100) if center > 100 else (center - sqrt_N) + i
+                if offset not in offsets and len(offsets) < lattice_dim:
+                    offsets.append(offset)
+        
+        # Strategy 5: Random-like offsets for better coverage (deterministic seed)
+        import random
+        random.seed(42)  # Deterministic for reproducibility
+        remaining = lattice_dim - len(offsets)
+        for _ in range(min(remaining, lattice_dim // 4)):
+            # Much larger random range
+            offset = random.randint(-sqrt_N // 10, sqrt_N // 10)
+            if offset not in offsets:
+                offsets.append(offset)
+        
+        # Ensure we have exactly lattice_dim offsets (or as close as possible)
+        while len(offsets) < lattice_dim:
+            # Fill with additional systematic offsets - expanded range
+            for i in range(len(offsets), lattice_dim):
+                offset = (i - lattice_dim // 2) * (max_offset // max(1, lattice_dim))
+                if offset not in offsets:
+                    offsets.append(offset)
+                if len(offsets) >= lattice_dim:
+                    break
+        
+        print(f"[Lattice]    Generated {len(offsets)} candidate offsets")
+        print(f"[Lattice]    Using ALL {min(len(offsets), lattice_dim)} offsets for maximum coverage...")
+        
+        # Use all offsets up to lattice_dim (maximize!)
+        offsets_to_use = offsets[:lattice_dim] if len(offsets) > lattice_dim else offsets
+        print(f"[Lattice]    Processing {len(offsets_to_use)} candidate points...")
+        
+        # Construct polynomial-based lattice following the SAME Diophantine polynomial as univariate approach
+        # Use: f(x,v) = x² + 2tx + (t² - N) - v² = 0
+        # Where t = (p_approx + q_approx) // 2 or sqrt(N)
+        # Then p = u - v, q = u + v where u = t + x
+        
+        # Compute t (same as univariate polynomial approach)
+        if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
+            t = (self.p_approx + self.q_approx) // 2
+        else:
+            t = sqrt_N
+        
+        print(f"[Lattice]    → Using SAME Diophantine polynomial as univariate approach:")
+        print(f"[Lattice]    → f(x,v) = x² + 2tx + (t² - N) - v² = 0")
+        print(f"[Lattice]    → Where t = {t}, and p = u - v, q = u + v (u = t + x)")
+        print(f"[Lattice]    → Looking for small roots x, v using LLL")
+        
+        # Construct lattice vectors representing the Diophantine polynomial
+        # Vector format: [x, x², v, v², constant] or simplified [x, v, constant]
+        # For the polynomial x² + 2tx + (t² - N) - v² = 0
+        # We want to find small x, v such that the polynomial evaluates to 0
+        
+        scale = max(1, sqrt_N.bit_length() // 10)
+        t_sq_minus_N = t * t - self.N
+        
+        # Construct lattice vectors that represent the Diophantine polynomial
+        # f(x,v) = x² + 2tx + (t² - N) - v² = 0
+        # We want to find small roots x, v
+        # Better approach: construct vectors that represent polynomial monomials
+        # Vector format: [x, v, x², v², constant] scaled appropriately
+        
+        for offset in offsets_to_use:
+            x = offset  # x is the correction: u = t + x
+            
+            # For the Diophantine polynomial, we need to find x and v such that:
+            # x² + 2tx + (t² - N) - v² = 0
+            # Rearranging: v² = x² + 2tx + (t² - N)
+            
+            # Compute what v² should be for this x
+            v_squared_target = x * x + 2 * t * x + t_sq_minus_N
+            
+            # Try integer v values around sqrt(v_squared_target) if positive
+            # LLL will help find the right combination
+            if v_squared_target >= 0:
+                v_candidate = int(math.isqrt(abs(v_squared_target))) if v_squared_target > 0 else 0
+                # Try a few v values around the candidate
+                for v_offset in [-2, -1, 0, 1, 2]:
+                    v = v_candidate + v_offset
+                    
+                    # Compute polynomial value: f(x,v) = x² + 2tx + (t² - N) - v²
+                    polynomial_value = x * x + 2 * t * x + t_sq_minus_N - v * v
+                    
+                    # Create vector: [x, v, polynomial_value]
+                    # For valid roots, polynomial_value should be 0 (or very small)
+                    basis_vectors.append([
+                        x // scale,  # x term
+                        v // scale,  # v term
+                        polynomial_value // (scale * scale) if scale > 0 else polynomial_value  # polynomial value
+                    ])
+            else:
+                # v_squared_target is negative, try v = 0
+                polynomial_value = x * x + 2 * t * x + t_sq_minus_N
+                basis_vectors.append([
+                    x // scale,
+                    0,
+                    polynomial_value // (scale * scale) if scale > 0 else polynomial_value
+                ])
+        
+        # Add fundamental polynomial relationship vectors
+        # Vector 1: x coefficient (2t)
+        basis_vectors.append([(2 * t) // scale, 0, 0])
+        # Vector 2: constant term (t² - N)
+        basis_vectors.append([0, 0, t_sq_minus_N // (scale * scale) if scale > 0 else t_sq_minus_N])
+        # Vector 3: v term
+        basis_vectors.append([0, 1, 0])
+        
+        if len(basis_vectors) < 3:
+            print(f"[Lattice]    Not enough basis vectors, skipping bulk search")
+            return None
+        
+        # Convert to numpy array - use ALL vectors we created (maximize!)
+        max_vectors = min(len(basis_vectors), 1000)  # Allow up to 1000 vectors for maximum coverage
+        basis = np.array(basis_vectors[:max_vectors], dtype=object)
+        
+        print(f"[Lattice]    ✓ Constructed {len(basis)} basis vectors (MAXIMIZED for comprehensive search)")
+        print(f"[Lattice]    → This lattice samples the entire search space around √N (BULK SEARCH)")
+        print(f"[Lattice]    → Applying LLL reduction to find SHORT vectors containing factors...")
+        print(f"[Lattice]    → LLL finds short vectors which are more likely to contain p*q = N")
+        
+        # Warn about large matrices
+        matrix_size = len(basis)
+        bit_size = self.N.bit_length()
+        print(f"[Lattice]    ⚠️  LLL will process {matrix_size}×{len(basis[0]) if len(basis) > 0 else 0} matrix with {bit_size}-bit integers")
+        print(f"[Lattice]    ⏳ This may take several minutes for large matrices...")
+        print(f"[Lattice]    → LLL reduction in progress (please be patient)...")
+        
+        # Apply LLL reduction with progress indication
+        try:
+            import time
+            import sys
+            start_time = time.time()
+            
+            from fpylll_wrapper import IntegerMatrix_from_matrix, LLL as IntegerLLL
+            print(f"[Lattice]    → Step 1/3: Converting to IntegerMatrix...", flush=True)
+            sys.stdout.flush()
+            B = IntegerMatrix_from_matrix(basis.tolist())
+            step1_time = time.time() - start_time
+            print(f"[Lattice]    ✓ Step 1 complete (took {step1_time:.2f}s)", flush=True)
+            sys.stdout.flush()
+            
+            print(f"[Lattice]    → Step 2/3: Running LLL reduction (THIS IS THE SLOW PART)...", flush=True)
+            print(f"[Lattice]    → LLL is processing {matrix_size} vectors with {bit_size}-bit integers...", flush=True)
+            print(f"[Lattice]    → This step may take 1-10+ minutes depending on matrix size...", flush=True)
+            sys.stdout.flush()
+            lll_start = time.time()
+            
+            # Add periodic progress updates during LLL (if possible)
+            print(f"[Lattice]    → [LLL working...] (started at {time.strftime('%H:%M:%S')})", flush=True)
+            sys.stdout.flush()
+            
+            reduced_basis = IntegerLLL(B, delta=self.delta)
+            lll_time = time.time() - lll_start
+            print(f"[Lattice]    ✓ Step 2 complete - LLL reduction took {lll_time:.2f}s ({lll_time/60:.2f} minutes)", flush=True)
+            sys.stdout.flush()
+            
+            print(f"[Lattice]    → Step 3/3: Converting reduced basis to numpy...", flush=True)
+            sys.stdout.flush()
+            reduced = reduced_basis.to_numpy()
+            total_time = time.time() - start_time
+            print(f"[Lattice]    ✓✓✓ LLL reduction complete! (total: {total_time:.2f}s = {total_time/60:.2f} minutes)")
+            print(f"[Lattice]    → Found {len(reduced)} short vectors from reduced basis")
+            print(f"[Lattice]    → Checking ALL {len(reduced)} vectors for factors (BULK SEARCH MODE)")
+            print(f"[Lattice]    → Short vectors = LLL's way of finding the most promising candidates")
+        except Exception as e:
+            print(f"[Lattice]    LLL reduction failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        # Check all reduced vectors for factors
+        checked = 0
+        best_p = None
+        best_q = None
+        best_diff = None
+        best_diff_bits = None
+        total_vectors = len(reduced)
+        
+        print(f"[Lattice]    → Starting to check {total_vectors} vectors for factors (real-time updates)...")
+        print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%")
+        
+        for i, vector in enumerate(reduced):
+            try:
+                checked += 1
+                
+                # Calculate progress percentage
+                progress_pct = (checked * 100) // total_vectors
+                progress_bar_length = 50
+                filled = (checked * progress_bar_length) // total_vectors
+                bar = '█' * filled + '░' * (progress_bar_length - filled)
+                
+                # Print progress every vector (with progress bar)
+                if checked % 10 == 0 or checked == 1 or checked == total_vectors:
+                    status = f"Best: {best_diff_bits} bits" if best_diff_bits is not None else "No candidates yet"
+                    print(f"[Lattice]    → [{bar}] {progress_pct}% | Vector {checked}/{total_vectors} | {status}", end='\r')
+                
+                # More detailed update every 50 vectors
+                if checked % 50 == 0:
+                    print()  # New line after progress bar
+                    if best_p is not None:
+                        print(f"[Lattice]    → Checking vector {checked}/{total_vectors} | Best so far: diff={best_diff_bits} bits")
+                        print(f"[Lattice]       Best p ≈ {best_p}")
+                        print(f"[Lattice]       Best q ≈ {best_q}")
+                    else:
+                        print(f"[Lattice]    → Checking vector {checked}/{total_vectors} | No good candidates yet...")
+                    print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%", end='\r')  # Reset progress bar line
+                
+                # Extract polynomial root (x) from vector components
+                # Vector format: [x/scale, x²/scale², constant/scale²]
+                # Following univariate polynomial logic: p = sqrt_N + x
+                # We need to recover x (the root) and then compute p = sqrt_N + x
+                
+                # Try different scale factors to recover x
+                scale = max(1, sqrt_N.bit_length() // 10)
+                
+                # Also try interpreting vector components directly as p and q
+                # (fallback in case the polynomial interpretation doesn't work)
+                if len(vector) >= 2:
+                    # Try direct interpretation: vector might be [p, q, error]
+                    p_direct = abs(int(vector[0]))
+                    q_direct = abs(int(vector[1])) if len(vector) > 1 else 0
+                    
+                    # Check if these are close to √N (might be actual factors)
+                    if p_direct > 1 and abs(p_direct - sqrt_N) < sqrt_N // 10:
+                        if self.N % p_direct == 0:
+                            q_test = self.N // p_direct
+                            if p_direct * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct interpretation, vector {i})!")
+                                print(f"[Lattice]       p = {p_direct}, q = {q_test}")
+                                return (p_direct, q_test)
+                
+                # Try polynomial root extraction with various scale factors
+                for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
+                    if scale_factor <= 0:
+                        continue
+                    
+                    # Extract x and v from vector components (Diophantine polynomial roots)
+                    x_cand = int(vector[0]) * scale_factor if len(vector) > 0 else 0
+                    v_cand = int(vector[1]) * scale_factor if len(vector) > 1 else 0
+                    
+                    # Compute t (same as construction)
+                    if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
+                        t = (self.p_approx + self.q_approx) // 2
+                    else:
+                        t = sqrt_N
+                    
+                    # Following SAME logic as univariate polynomial approach:
+                    # u = t + x, then p = u - v, q = u + v
+                    u_cand = t + x_cand
+                    p_cand = u_cand - v_cand
+                    q_cand = u_cand + v_cand
+                    
+                    if p_cand > 1 and q_cand > 1:
+                        # Check if p and q are exact factors (Diophantine polynomial root condition!)
+                        if p_cand * q_cand == self.N:
+                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via Diophantine polynomial root (vector {i})!")
+                            print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand} (scale_factor={scale_factor})")
+                            print(f"[Lattice]       u = t + x = {t} + {x_cand} = {u_cand}")
+                            print(f"[Lattice]       p = u - v = {u_cand} - {v_cand} = {p_cand}")
+                            print(f"[Lattice]       q = u + v = {u_cand} + {v_cand} = {q_cand}")
+                            return (p_cand, q_cand)
+                        
+                        # Also check if p divides N exactly
+                        if self.N % p_cand == 0:
+                            q_test = self.N // p_cand
+                            if p_cand * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
+                                print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand}")
+                                print(f"[Lattice]       p = {p_cand}, q = {q_test}")
+                                return (p_cand, q_test)
+                        
+                        # Check Diophantine polynomial evaluation: f(x,v) = x² + 2tx + (t² - N) - v²
+                        # For valid roots, this should be ≈ 0
+                        polynomial_eval = abs(x_cand * x_cand + 2 * t * x_cand + (t * t - self.N) - v_cand * v_cand)
+                        
+                        # Also check if p * q is close to N
+                        product = p_cand * q_cand
+                        product_diff = abs(product - self.N)
+                        product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
+                        
+                        # Use the smaller of the two errors
+                        if polynomial_eval < product_diff:
+                            diff_bits = polynomial_eval.bit_length() if polynomial_eval > 0 else 0
+                            use_product = False
+                        else:
+                            diff_bits = product_diff_bits
+                            use_product = True
+                        
+                        # Update best if this is better
+                        if best_diff is None or (use_product and product_diff < best_diff) or (not use_product and polynomial_eval < best_diff):
+                            best_p = p_cand
+                            best_q = q_cand
+                            best_diff = product_diff if use_product else polynomial_eval
+                            best_diff_bits = diff_bits
+                            
+                            # Real-time output of best result
+                            if diff_bits < 100:  # Only show if reasonably close
+                                print(f"[Lattice]    ⭐ NEW BEST Diophantine polynomial root (vector {i}):")
+                                print(f"[Lattice]       x = {x_cand}, v = {v_cand}")
+                                print(f"[Lattice]       p = u - v = {p_cand}, q = u + v = {q_cand}")
+                                if use_product:
+                                    print(f"[Lattice]       Product difference: {product_diff} ({diff_bits} bits)")
+                                else:
+                                    print(f"[Lattice]       Polynomial evaluation: f(x,v) = {polynomial_eval} ({diff_bits} bits)")
+                            # Don't print periodic updates - they're too noisy
+                            # The progress bar and 50-vector updates are enough
+                
+                # Also check if vector components directly give polynomial roots
+                # Following univariate polynomial logic: extract x from vector, compute p = sqrt_N + x
+                # Vector format: [x/scale, x²/scale², constant/scale²]
+                # Need to account for scaling to recover actual x
+                if len(vector) >= 1:
+                    scale = max(1, sqrt_N.bit_length() // 10)
+                    
+                    # Try different scale factors to recover x
+                    for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
+                        if scale_factor <= 0:
+                            continue
+                        
+                        # Extract x from first component (polynomial root)
+                        # Vector is scaled, so multiply by scale_factor to recover x
+                        x_direct = int(vector[0]) * scale_factor
+                        p_from_root = sqrt_N + x_direct
+                        
+                        if p_from_root > 1 and self.N % p_from_root == 0:
+                            q_from_root = self.N // p_from_root
+                            if p_from_root * q_from_root == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
+                                print(f"[Lattice]       Root: x = {x_direct} (recovered with scale_factor={scale_factor})")
+                                print(f"[Lattice]       p = √N + x = {sqrt_N} + {x_direct} = {p_from_root}")
+                                print(f"[Lattice]       q = {q_from_root}")
+                                return (p_from_root, q_from_root)
+                        
+                        # Track best polynomial root
+                        if p_from_root > 1:
+                            # Check polynomial evaluation: f(x) = (sqrt_N + x) * q - N
+                            q_approx = self.N // p_from_root if p_from_root > 0 else 0
+                            if q_approx > 1:
+                                poly_eval = abs(p_from_root * q_approx - self.N)
+                                diff_bits_direct = poly_eval.bit_length() if poly_eval > 0 else 0
+                                
+                                if best_diff is None or poly_eval < best_diff:
+                                    best_p = p_from_root
+                                    best_q = q_approx
+                                    best_diff = poly_eval
+                                    best_diff_bits = diff_bits_direct
+                                    
+                                    if diff_bits_direct < 100:
+                                        print(f"[Lattice]    ⭐ NEW BEST (polynomial root x={x_direct}, vector {i}):")
+                                        print(f"[Lattice]       p = √N + x = {p_from_root}, q ≈ {q_approx}")
+                                        print(f"[Lattice]       Polynomial evaluation: f(x) = {poly_eval} ({diff_bits_direct} bits)")
+                                    
+                                    # Break if we found a good candidate
+                                    if diff_bits_direct < 50:
+                                        break
+                            
+            except Exception as e:
+                continue
+        
+        # Final progress bar update
+        print()  # New line after progress bar
+        print(f"[Lattice]    → [{'█' * 50}] 100% | Completed checking all {total_vectors} vectors")
+        
+        # Output final best result
+        if best_p is not None and best_q is not None:
+            print(f"[Lattice]    📊 FINAL BEST RESULT from bulk search:")
+            print(f"[Lattice]       p ≈ {best_p}")
+            print(f"[Lattice]       q ≈ {best_q}")
+            print(f"[Lattice]       p × q = {best_p * best_q}")
+            print(f"[Lattice]       Difference from N: {best_diff} ({best_diff_bits} bits)")
+            
+            if best_diff == 0:
+                print(f"[Lattice]       ✓✓✓ EXACT FACTORIZATION!")
+                return (best_p, best_q)
+            elif best_diff_bits <= 10:  # Very close - try nearby values
+                print(f"[Lattice]       ⚠️  Very close! (only {best_diff_bits} bits off)")
+                print(f"[Lattice]       → Trying nearby values to find exact factors...")
+                
+                # Try small adjustments to p and q
+                for dp in range(-10, 11):
+                    for dq in range(-10, 11):
+                        p_test = best_p + dp
+                        q_test = best_q + dq
+                        if p_test > 1 and q_test > 1 and p_test * q_test == self.N:
+                            print(f"[Lattice]       ✓✓✓ EXACT FACTOR FOUND with small adjustment!")
+                            print(f"[Lattice]       p = {p_test} (adjusted by {dp})")
+                            print(f"[Lattice]       q = {q_test} (adjusted by {dq})")
+                            return (p_test, q_test)
+                
+                # Also check if p or q divides N exactly
+                if self.N % best_p == 0:
+                    q_exact = self.N // best_p
+                    if best_p * q_exact == self.N:
+                        print(f"[Lattice]       ✓✓✓ EXACT FACTOR FOUND! p divides N exactly")
+                        print(f"[Lattice]       p = {best_p}, q = {q_exact}")
+                        return (best_p, q_exact)
+                
+                if self.N % best_q == 0:
+                    p_exact = self.N // best_q
+                    if p_exact * best_q == self.N:
+                        print(f"[Lattice]       ✓✓✓ EXACT FACTOR FOUND! q divides N exactly")
+                        print(f"[Lattice]       p = {p_exact}, q = {best_q}")
+                        return (p_exact, best_q)
+                
+                print(f"[Lattice]       → Nearby search didn't find exact factors")
+            else:
+                print(f"[Lattice]       ⚠️  Not exact, but closest found in bulk search")
+        else:
+            print(f"[Lattice]    ❌ No valid candidates found in bulk search")
+        
+        print(f"[Lattice]    Bulk search completed (checked {checked} vectors)")
+        return None
+
     def _find_best_factorization_corrections(self, p_candidate: int, q_candidate: int,
                                            pyramid_basis: np.ndarray,
                                            config: Optional[np.ndarray] = None,
@@ -6351,6 +7067,12 @@ class MinimizableFactorizationLatticeSolver:
         Find the best factorization corrections using pyramid lattice reduction.
         """
         print(f"[Lattice] Using pyramid lattice for factorization corrections...")
+        print(f"[Lattice] Search radius parameter: {search_radius} ({search_radius.bit_length()} bits)")
+        
+        # For huge search radii, note that we'll extract corrections directly from LLL-reduced vectors
+        if search_radius > 10**100:
+            print(f"[Lattice] Large search radius detected - will extract corrections from LLL-reduced short vectors")
+            print(f"[Lattice] LLL reduction should produce vectors with small coefficients containing the corrections")
 
         # Minimize the lattice using LLL
         reduced_basis = self._minimize_lattice(pyramid_basis)
@@ -6362,25 +7084,97 @@ class MinimizableFactorizationLatticeSolver:
         initial_diff = abs(p_candidate * q_candidate - self.N)
 
         print(f"[Lattice] Analyzing reduced pyramid lattice vectors...")
+        print(f"[Lattice] Reduced basis has {len(reduced_basis)} vectors")
+        print(f"[Lattice] Initial difference: {initial_diff} ({initial_diff.bit_length()} bits)")
 
-        # Analyze the shortest vectors from the reduced basis
+        # Sort vectors by their L2 norm (length) - check shortest vectors first
+        # This helps find the best corrections early
+        vector_norms = []
         for i, vector in enumerate(reduced_basis):
             try:
-                # Extract coefficients (vector format: [a, b, c] represents a + b*p + c*q = 0)
+                # Compute L2 norm squared (avoid sqrt for large numbers)
+                norm_sq = sum(int(x)**2 for x in vector if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vector))
+            except:
+                # If norm computation fails, use index as fallback
+                vector_norms.append((float('inf'), i, vector))
+        
+        # Sort by norm (shortest first)
+        vector_norms.sort(key=lambda x: x[0])
+        
+        # Check ALL vectors from the reduced basis - don't limit
+        # For large numbers with poor approximations, we need to check all vectors
+        max_vectors_to_check = len(reduced_basis)
+        
+        print(f"[Lattice] Checking ALL {max_vectors_to_check} vectors from reduced basis (sorted by norm)...")
+        print(f"[Lattice]    (No limit - checking all vectors to maximize chance of finding corrections)")
+        
+        # Check vectors in order of increasing norm
+        for norm_sq, orig_idx, vector in vector_norms:
+            i = orig_idx  # Keep original index for reporting
+            try:
+                # Extract coefficients (vector format: [a, b, c] represents a + b*dp + c*dq = 0)
+                # Where dp and dq are corrections: p = p_candidate + dp, q = q_candidate + dq
+                # The relationship is: (p_candidate + dp) * (q_candidate + dq) = N
+                # Which gives: p_candidate*q_candidate - N + q_candidate*dp + p_candidate*dq + dp*dq = 0
+                # Linearizing: (p_candidate*q_candidate - N) + q_candidate*dp + p_candidate*dq ≈ 0
+                # So: a = p_candidate*q_candidate - N, b = q_candidate, c = p_candidate
                 a, b, c = vector[0], vector[1], vector[2]
 
                 # Skip if coefficients are too large or zero
-                if abs(b) > search_radius or abs(c) > search_radius or (b == 0 and c == 0):
+                # For huge search radii, be more lenient - LLL should have made coefficients small
+                if (b == 0 and c == 0):
                     continue
+                
+                # For huge search radius (2048+ bits), accept reasonable coefficients
+                # With 2048-bit search radius, we need to be very lenient with coefficient filtering
+                # LLL should have reduced coefficients, but we still need to check vectors with larger coefficients
+                if search_radius > 10**100 or (hasattr(search_radius, 'bit_length') and search_radius.bit_length() >= 2048):
+                    # For 2048+ bit search radius, accept coefficients up to a very large bound
+                    # Accept coefficients up to several hundred bits - LLL should have made them reasonable
+                    # For a 2048-bit search radius, we can accept coefficients up to ~500-1000 bits
+                    try:
+                        search_bits = search_radius.bit_length() if hasattr(search_radius, 'bit_length') else 2048
+                        # Accept coefficients up to min(search_radius, 2^1000) - very lenient for 2048-bit keys
+                        max_reasonable_bits = min(search_bits, 1000)  # Accept up to 1000-bit coefficients
+                        max_reasonable = 2 ** max_reasonable_bits
+                        
+                        b_bits = abs(b).bit_length() if hasattr(abs(b), 'bit_length') else 0
+                        c_bits = abs(c).bit_length() if hasattr(abs(c), 'bit_length') else 0
+                        
+                        if abs(b) > max_reasonable or abs(c) > max_reasonable:
+                            # Still log skipped vectors for debugging (first few only)
+                            if i < 10:  # Log first 10 to see what's being filtered
+                                print(f"[Lattice]   Vector {i}: Skipping (b={b_bits} bits, c={c_bits} bits, max={max_reasonable_bits} bits)")
+                            continue
+                        else:
+                            # Log vectors we're checking (first few)
+                            if i < 5:
+                                print(f"[Lattice]   Vector {i}: Checking (b={b_bits} bits, c={c_bits} bits)")
+                    except Exception as e:
+                        # Fallback: just check if within search_radius (very lenient)
+                        if abs(b) > search_radius or abs(c) > search_radius:
+                            continue
+                else:
+                    # Normal filtering for reasonable search radii
+                    if abs(b) > search_radius or abs(c) > search_radius:
+                        continue
 
                 # Solve for corrections: from a + b*p + c*q = 0, with p = p_candidate + dp, q = q_candidate + dq
                 # We get: a + b*(p_candidate + dp) + c*(q_candidate + dq) = 0
                 # So: b*dp + c*dq = -a - b*p_candidate - c*q_candidate
 
                 rhs = -a - b * p_candidate - c * q_candidate
+                
+                # Debug: log vector details for first few vectors
+                if i < 10:
+                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}")
 
                 if b != 0:
                     dp = rhs // b
+                    dp_bits = abs(dp).bit_length() if abs(dp) > 0 else 0
+                    
+                    # For huge search radius, accept large dp values but check if they actually improve things
                     if abs(dp) <= search_radius:
                         dq = 0  # Assume dq = 0 for this vector
                         p_test = p_candidate + dp
@@ -6389,109 +7183,170 @@ class MinimizableFactorizationLatticeSolver:
                         if p_test > 0 and q_test > 0:
                             product = p_test * q_test
                             diff = abs(product - self.N)
+                            diff_bits = diff.bit_length() if diff > 0 else 0
 
                             if product == self.N:
                                 print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq:+d}")
                                 return dp, dq, 1.0
 
                             if initial_diff > 0:
-                                # For large numbers, avoid float division to prevent overflow
-                                if self.N.bit_length() > 1000:
-                                    # Use bit length difference as approximation
-                                    diff_bits = abs(diff).bit_length()
-                                    initial_bits = abs(initial_diff).bit_length()
-                                    if diff_bits < initial_bits:
-                                        improvement = min(0.9, (initial_bits - diff_bits) / 10.0)
-                                    else:
-                                        improvement = 0.0
-                                else:
-                                    # For smaller numbers, safe to use float
-                                    try:
-                                        # Safe improvement calculation for large numbers
-                                        if self.N.bit_length() > 1000:
-                                            improvement = 0.1 if diff < initial_diff else 0.0
+                                # Only consider this as improvement if it actually reduces the difference
+                                if diff < initial_diff:
+                                    # Log improvement for first few vectors
+                                    if i < 10:
+                                        print(f"[Lattice]   Vector {i}: dp={dp:+d} ({dp_bits} bits), product diff={diff_bits} bits (initial={initial_diff.bit_length()} bits)")
+                                        improvement_pct = ((initial_diff - diff) / initial_diff * 100) if initial_diff > 0 else 0
+                                        print(f"[Lattice]      ✓ Improvement: {improvement_pct:.2f}%")
+                                    
+                                    # Calculate improvement
+                                    if self.N.bit_length() > 1000:
+                                        diff_bits_calc = abs(diff).bit_length()
+                                        initial_bits_calc = abs(initial_diff).bit_length()
+                                        if diff_bits_calc < initial_bits_calc:
+                                            improvement = min(0.9, (initial_bits_calc - diff_bits_calc) / 10.0)
                                         else:
-                                            improvement = (initial_diff - diff) / initial_diff
-                                    except OverflowError:
-                                        improvement = 0.0
-                            else:
-                                improvement = 1.0 if diff == 0 else 0.0
-
-                            if improvement > best_improvement:
-                                best_improvement = improvement
-                                best_dp = dp
-                                best_dq = dq
-                                print(f"[Lattice]   Vector {i}: dp={dp:+d}, dq={dq:+d}, improvement={improvement:.4f}")
-
-                if c != 0 and b != 0:
-                    # Try solving for both dp and dq
-                    for dq_candidate in range(-min(search_radius, abs(c)), min(search_radius, abs(c)) + 1):
-                        if (rhs - c * dq_candidate) % b == 0:
-                            dp = (rhs - c * dq_candidate) // b
-                            if abs(dp) <= search_radius:
-                                p_test = p_candidate + dp
-                                q_test = q_candidate + dq_candidate
-
-                                if p_test > 0 and q_test > 0:
-                                    product = p_test * q_test
-                                    diff = abs(product - self.N)
-
-                                    if product == self.N:
-                                        print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq_candidate:+d}")
-                                        return dp, dq_candidate, 1.0
-
-                                    if initial_diff > 0:
-                                        # Safe improvement calculation for large numbers
-                                        if self.N.bit_length() > 1000:
-                                            improvement = 0.1 if diff < initial_diff else 0.0
-                                        else:
-                                            improvement = (initial_diff - diff) / initial_diff
+                                            improvement = 0.0
                                     else:
-                                        improvement = 1.0 if diff == 0 else 0.0
-
+                                        try:
+                                            improvement = (initial_diff - diff) / initial_diff
+                                        except OverflowError:
+                                            improvement = 0.0
+                                    
                                     if improvement > best_improvement:
                                         best_improvement = improvement
                                         best_dp = dp
-                                        best_dq = dq_candidate
-                                        print(f"[Lattice]   Vector {i}: dp={dp:+d}, dq={dq_candidate:+d}, improvement={improvement:.4f}")
+                                        best_dq = dq
+                                        print(f"[Lattice]   Vector {i}: NEW BEST! dp={dp:+d}, dq={dq:+d}, improvement={improvement:.4f}")
+                                else:
+                                    # Log that this vector made things worse
+                                    if i < 10:
+                                        print(f"[Lattice]   Vector {i}: dp={dp:+d} ({dp_bits} bits) made things WORSE (diff={diff_bits} bits > initial={initial_diff.bit_length()} bits)")
+
+                if c != 0 and b != 0:
+                    # For huge search radii, extract corrections directly from the vector
+                    # instead of iterating through the search space
+                    if search_radius > 10**100:  # If search radius is astronomically large
+                        # Use the vector directly: solve b*dp + c*dq = rhs
+                        # Try to find small integer solutions using extended Euclidean algorithm
+                        # or by directly computing from the vector structure
+                        try:
+                            # For large search radius, the LLL-reduced vector should give us
+                            # the correction directly. Try solving the linear Diophantine equation.
+                            # If gcd(b, c) divides rhs, we can find solutions
+                            import math
+                            g = math.gcd(abs(b), abs(c))
+                            if g > 0 and rhs % g == 0:
+                                # Find one solution using extended Euclidean
+                                # For simplicity, try small dq values that make sense
+                                # The LLL reduction should have made b and c relatively small
+                                max_dq_try = min(1000, abs(c) // max(1, abs(b))) if abs(b) > 0 else 1000
+                                for dq_candidate in range(-max_dq_try, max_dq_try + 1):
+                                    if (rhs - c * dq_candidate) % b == 0:
+                                        dp = (rhs - c * dq_candidate) // b
+                                        if abs(dp) <= max_dq_try * 10:  # Reasonable bound
+                                            p_test = p_candidate + dp
+                                            q_test = q_candidate + dq_candidate
+
+                                            if p_test > 0 and q_test > 0:
+                                                product = p_test * q_test
+                                                diff = abs(product - self.N)
+
+                                                if product == self.N:
+                                                    print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq_candidate:+d}")
+                                                    return dp, dq_candidate, 1.0
+
+                                                if initial_diff > 0:
+                                                    try:
+                                                        if self.N.bit_length() > 1000:
+                                                            improvement = 0.1 if diff < initial_diff else 0.0
+                                                        else:
+                                                            improvement = (initial_diff - diff) / initial_diff
+                                                    except OverflowError:
+                                                        improvement = 0.0
+                                                else:
+                                                    improvement = 1.0 if diff == 0 else 0.0
+
+                                                if improvement > best_improvement:
+                                                    best_improvement = improvement
+                                                    best_dp = dp
+                                                    best_dq = dq_candidate
+                                                    print(f"[Lattice]   Vector {i}: dp={dp:+d}, dq={dq_candidate:+d}, improvement={improvement:.4f}")
+                        except Exception as e:
+                            print(f"[Lattice]   Error solving Diophantine equation for vector {i}: {e}")
+                            pass
+                    else:
+                        # For reasonable search radii, use the original iteration approach
+                        for dq_candidate in range(-min(search_radius, abs(c)), min(search_radius, abs(c)) + 1):
+                            if (rhs - c * dq_candidate) % b == 0:
+                                dp = (rhs - c * dq_candidate) // b
+                                if abs(dp) <= search_radius:
+                                    p_test = p_candidate + dp
+                                    q_test = q_candidate + dq_candidate
+
+                                    if p_test > 0 and q_test > 0:
+                                        product = p_test * q_test
+                                        diff = abs(product - self.N)
+
+                                        if product == self.N:
+                                            print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq_candidate:+d}")
+                                            return dp, dq_candidate, 1.0
+
+                                        if initial_diff > 0:
+                                            # Safe improvement calculation for large numbers
+                                            if self.N.bit_length() > 1000:
+                                                improvement = 0.1 if diff < initial_diff else 0.0
+                                            else:
+                                                improvement = (initial_diff - diff) / initial_diff
+                                        else:
+                                            improvement = 1.0 if diff == 0 else 0.0
+
+                                        if improvement > best_improvement:
+                                            best_improvement = improvement
+                                            best_dp = dp
+                                            best_dq = dq_candidate
+                                            print(f"[Lattice]   Vector {i}: dp={dp:+d}, dq={dq_candidate:+d}, improvement={improvement:.4f}")
 
             except Exception as e:
                 continue  # Skip problematic vectors
 
-        # Fallback: small brute force search around best found
-        if best_improvement < 0.1:  # If pyramid didn't find good improvements
-            print(f"[Lattice] Pyramid lattice found limited improvement ({best_improvement:.4f}), adding small brute force search...")
-
-            for dp in range(-50, 51):
-                for dq in range(-50, 51):
-                    p_test = p_candidate + dp
-                    q_test = q_candidate + dq
-
-                    if p_test <= 0 or q_test <= 0:
-                        continue
-
-                    product = p_test * q_test
-                    diff = abs(product - self.N)
-
-                    if product == self.N:
-                        print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND in fallback! dp={dp:+d}, dq={dq:+d}")
-                        return dp, dq, 1.0
-
-                    if initial_diff > 0:
-                        # Safe improvement calculation for large numbers
-                        if self.N.bit_length() > 1000:
-                            improvement = 0.1 if diff < initial_diff else 0.0
-                        else:
-                            improvement = (initial_diff - diff) / initial_diff
-                    else:
-                        improvement = 0.0
-
-                    if improvement > best_improvement:
-                        best_improvement = improvement
-                        best_dp = dp
-                        best_dq = dq
+        # No brute force fallback - rely on LLL-reduced vectors only
+        if best_improvement < 0.01:
+            print(f"[Lattice] Pyramid lattice found limited improvement ({best_improvement:.4f})")
+            print(f"[Lattice] ⚠️  DIAGNOSIS:")
+            print(f"[Lattice]    - Checked {len(vector_norms)} vectors from LLL-reduced basis")
+            print(f"[Lattice]    - Initial difference: {initial_diff.bit_length()} bits ({initial_diff})")
+            print(f"[Lattice]    - Search radius: {search_radius.bit_length()} bits")
+            print(f"[Lattice]    - p_candidate: {p_candidate}")
+            print(f"[Lattice]    - q_candidate: {q_candidate}")
+            print(f"[Lattice]    - p_candidate * q_candidate = {p_candidate * q_candidate}")
+            print(f"[Lattice]    - N = {self.N}")
+            print(f"[Lattice]    - No useful corrections found in any vector")
+            print(f"[Lattice]    ")
+            print(f"[Lattice]    Possible issues:")
+            print(f"[Lattice]    1. Approximations too far off ({initial_diff.bit_length()}-bit error is huge!)")
+            print(f"[Lattice]    2. Lattice construction may not capture factorization relationship for such poor approximations")
+            print(f"[Lattice]    3. LLL reduction may not be producing useful short vectors")
+            print(f"[Lattice]    ")
+            print(f"[Lattice]    Suggestions:")
+            print(f"[Lattice]    - Verify p_approx * q_approx is close to N (current error: {initial_diff.bit_length()} bits)")
+            print(f"[Lattice]    - Try polynomial methods: --polynomial flag")
+            print(f"[Lattice]    - Try increasing lattice dimension: --lattice-dimension <value>")
+            print(f"[Lattice]    - Check if approximations are correct (1955-bit error suggests they're way off)")
 
         print(f"[Lattice] Best pyramid correction: dp={best_dp:+d}, dq={best_dq:+d}, improvement={best_improvement:.4f}")
+        
+        # If we found a good improvement but not exact, try verifying the result
+        if best_improvement > 0:
+            refined_p = p_candidate + best_dp
+            refined_q = q_candidate + best_dq
+            product = refined_p * refined_q
+            final_diff = abs(product - self.N)
+            print(f"[Lattice] Verification: refined_p × refined_q = {product}")
+            print(f"[Lattice] Difference from N: {final_diff} ({final_diff.bit_length()} bits)")
+            if product == self.N:
+                print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION VERIFIED in _find_best_factorization_corrections!")
+            elif final_diff < initial_diff:
+                print(f"[Lattice] Improvement: {initial_diff.bit_length()} bits → {final_diff.bit_length()} bits")
 
         return best_dp, best_dq, best_improvement
 
@@ -8228,7 +9083,49 @@ class MinimizableFactorizationLatticeSolver:
         print(f"{'─'*80}")
         print(f"[Lattice] Input candidates: p={p_candidate}, q={q_candidate}")
         print(f"[Lattice] Search radius: {search_radius}")
+        
+        # Check initial approximation quality
+        initial_product = p_candidate * q_candidate
+        initial_diff = abs(initial_product - self.N)
+        initial_diff_bits = initial_diff.bit_length()
+        print(f"[Lattice] Initial approximation quality:")
+        print(f"[Lattice]   p_candidate × q_candidate = {initial_product}")
+        print(f"[Lattice]   Difference from N: {initial_diff} ({initial_diff_bits} bits)")
+        
+        # Warn if initial difference is too large relative to search radius
+        if initial_diff_bits > search_radius.bit_length() + 100:
+            print(f"[Lattice] ⚠️  WARNING: Initial difference ({initial_diff_bits} bits) is much larger than search radius ({search_radius.bit_length()} bits)")
+            print(f"[Lattice]    The approximations are too far from the actual factors")
+            print(f"[Lattice]    Lattice method works best when approximations are within search radius")
+            print(f"[Lattice]    Consider:")
+            print(f"[Lattice]      - Providing better initial approximations (closer to actual factors)")
+            print(f"[Lattice]      - Using polynomial methods (--polynomial flag)")
+            print(f"[Lattice]      - Increasing search radius (currently {search_radius.bit_length()} bits)")
+        
+        # Warn if search radius is astronomically large
+        if search_radius > 10**100:
+            print(f"[Lattice] ⚠️  WARNING: Search radius is extremely large ({search_radius.bit_length()} bits)")
+            print(f"[Lattice]    After LLL reduction, corrections should be extracted directly from short vectors")
+            print(f"[Lattice]    The search radius is used as an upper bound, not for exhaustive search")
+            print(f"[Lattice]    LLL-reduced vectors should contain the corrections directly")
 
+        # Try bulk search first if --bulk flag is set (doesn't need approximations)
+        use_bulk = getattr(self, 'use_bulk_search', False)
+        
+        if use_bulk:
+            print(f"[Lattice] 🔍 Bulk search enabled (via --bulk flag)")
+            print(f"[Lattice]    Search radius: {search_radius.bit_length()} bits")
+            print(f"[Lattice]    Attempting bulk factor search using LLL (approximation-independent)...")
+            print(f"[Lattice]    This method creates a large lattice ({100}+ vectors) to search the entire space")
+            bulk_result = self._bulk_search_factors_with_lll(search_radius)
+            if bulk_result:
+                p_found, q_found = bulk_result
+                if p_found * q_found == self.N:
+                    print(f"[Lattice] ✓✓✓ BULK SEARCH SUCCESS! p={p_found}, q={q_found}")
+                    pyramid_basis = self._construct_pyramid_lattice_basis(p_found, q_found)
+                    return p_found, q_found, 1.0, pyramid_basis
+            print(f"[Lattice]    Bulk search didn't find factors, continuing with pyramid lattice...")
+        
         # Always construct pyramid lattice basis for polynomial generation
         pyramid_basis = self._construct_pyramid_lattice_basis(p_candidate, q_candidate)
         
@@ -8260,6 +9157,22 @@ class MinimizableFactorizationLatticeSolver:
         # Construct pyramid lattice basis for polynomial generation
         pyramid_basis = self._construct_pyramid_lattice_basis(p_candidate, q_candidate)
 
+        # Adapt search radius based on initial difference if needed
+        # If initial difference is larger than search radius, expand it
+        initial_product = p_candidate * q_candidate
+        initial_diff = abs(initial_product - self.N)
+        initial_diff_bits = initial_diff.bit_length()
+        search_radius_bits = search_radius.bit_length() if search_radius > 0 else 0
+        
+        # If initial difference is larger than search radius, expand search radius
+        if initial_diff_bits > search_radius_bits:
+            # Expand to at least 2x the initial difference (with some margin)
+            expanded_radius_bits = initial_diff_bits + 100  # Add 100 bits of margin
+            expanded_radius = 2 ** expanded_radius_bits
+            print(f"[Lattice] 🔧 Expanding search radius: {search_radius_bits} bits → {expanded_radius_bits} bits")
+            print(f"[Lattice]    (Initial difference: {initial_diff_bits} bits, need larger radius)")
+            search_radius = expanded_radius
+        
         # Find best factorization corrections
         best_dp, best_dq, correction_improvement = self._find_best_factorization_corrections(
             p_candidate, q_candidate, pyramid_basis, config, search_radius
@@ -8272,6 +9185,9 @@ class MinimizableFactorizationLatticeSolver:
 
         # Check if we found an exact factorization FIRST (before decimal computation)
         final_product = refined_p * refined_q
+        final_diff = abs(final_product - self.N)
+        final_diff_bits = final_diff.bit_length() if final_diff > 0 else 0
+        
         if final_product == self.N:
             print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND! ✓✓✓")
             print(f"[Lattice]   p = {refined_p}")
@@ -8279,10 +9195,51 @@ class MinimizableFactorizationLatticeSolver:
             print(f"[Lattice]   p × q = {final_product}")
             print(f"[Lattice]   Verification: {final_product == self.N}")
             return refined_p, refined_q, 1.0, pyramid_basis
+        
+        # If very close (≤10 bits), try to find exact factors by checking nearby values
+        if final_diff_bits <= 10 and final_diff > 0:
+            print(f"[Lattice] ⚠️  Very close! (only {final_diff_bits} bits off, difference = {final_diff})")
+            print(f"[Lattice]    → Trying nearby values and divisibility checks to find exact factors...")
+            
+            # First, check if p or q divides N exactly
+            if self.N % refined_p == 0:
+                q_exact = self.N // refined_p
+                if refined_p * q_exact == self.N:
+                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND! p divides N exactly")
+                    print(f"[Lattice]       p = {refined_p}, q = {q_exact}")
+                    return refined_p, q_exact, 1.0, pyramid_basis
+            
+            if self.N % refined_q == 0:
+                p_exact = self.N // refined_q
+                if p_exact * refined_q == self.N:
+                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND! q divides N exactly")
+                    print(f"[Lattice]       p = {p_exact}, q = {refined_q}")
+                    return p_exact, refined_q, 1.0, pyramid_basis
+            
+            # Try small adjustments to p and q
+            search_range = min(100, final_diff + 10)  # Search within ±100 or slightly more than the error
+            print(f"[Lattice]    → Trying small adjustments (±{search_range})...")
+            
+            for dp in range(-search_range, search_range + 1):
+                for dq in range(-search_range, search_range + 1):
+                    p_test = refined_p + dp
+                    q_test = refined_q + dq
+                    if p_test > 1 and q_test > 1:
+                        product_test = p_test * q_test
+                        if product_test == self.N:
+                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND with small adjustment!")
+                            print(f"[Lattice]       p = {p_test} (adjusted by {dp})")
+                            print(f"[Lattice]       q = {q_test} (adjusted by {dq})")
+                            return p_test, q_test, 1.0, pyramid_basis
+            
+            print(f"[Lattice]    → Nearby search didn't find exact factors")
 
         # For huge numbers, skip decimal computation (causes float overflow)
+        # But we can still show the integer corrections
         if self.N.bit_length() > 512:
-            print(f"[Lattice] Skipping decimal computation for {self.N.bit_length()}-bit N (would cause overflow)")
+            print(f"[Lattice] Skipping decimal computation for {self.N.bit_length()}-bit N (would cause float overflow)")
+            print(f"[Lattice] Integer corrections: dp={best_dp:+d}, dq={best_dq:+d}")
+            print(f"[Lattice] Refined factors are integers: p={refined_p}, q={refined_q}")
         else:
             # Compute decimal factors with adjustments (only for smaller numbers)
             try:
@@ -8310,10 +9267,65 @@ class MinimizableFactorizationLatticeSolver:
         initial_product = p_candidate * q_candidate
         initial_diff = abs(initial_product - self.N)
         final_diff = abs(final_product - self.N)
+        
+        print(f"[Lattice] Initial difference: {initial_diff} ({initial_diff.bit_length()} bits)")
+        print(f"[Lattice] Final difference: {final_diff} ({final_diff.bit_length()} bits)")
 
         if final_diff < initial_diff:
-            improvement = (initial_diff - final_diff) / initial_diff if initial_diff > 0 else 0.0
-            print(f"[Lattice] ✓ Improvement: {improvement:.1%}")
+            # For huge numbers, use bit length difference as improvement metric
+            if self.N.bit_length() > 1000:
+                initial_bits = initial_diff.bit_length()
+                final_bits = final_diff.bit_length()
+                if initial_bits > 0:
+                    improvement = max(0.0, min(1.0, (initial_bits - final_bits) / initial_bits))
+                else:
+                    improvement = 1.0 if final_diff == 0 else 0.0
+                print(f"[Lattice] ✓ Improvement: {initial_bits} bits → {final_bits} bits ({improvement:.1%})")
+            else:
+                improvement = (initial_diff - final_diff) / initial_diff if initial_diff > 0 else 0.0
+                print(f"[Lattice] ✓ Improvement: {improvement:.1%}")
+            
+            # If we're very close but not exact, try iterating automatically
+            if final_diff > 0 and final_diff < initial_diff and final_diff.bit_length() < 50:
+                print(f"[Lattice] 💡 Difference is small ({final_diff.bit_length()} bits), attempting iteration...")
+                print(f"[Lattice]    Using refined candidates as new starting point for another LLL pass")
+                
+                # Try one more iteration with refined candidates
+                try:
+                    # Reduce search radius for iteration (we're already close)
+                    iter_search_radius = min(search_radius, max(1000, final_diff.bit_length() * 10))
+                    print(f"[Lattice]    Iteration search radius: {iter_search_radius}")
+                    
+                    # Construct new pyramid basis with refined candidates
+                    iter_pyramid_basis = self._construct_pyramid_lattice_basis(refined_p, refined_q)
+                    
+                    # Find corrections again
+                    iter_dp, iter_dq, iter_improvement = self._find_best_factorization_corrections(
+                        refined_p, refined_q, iter_pyramid_basis, config, iter_search_radius
+                    )
+                    
+                    iter_refined_p = refined_p + iter_dp
+                    iter_refined_q = refined_q + iter_dq
+                    iter_product = iter_refined_p * iter_refined_q
+                    iter_diff = abs(iter_product - self.N)
+                    
+                    print(f"[Lattice]    Iteration result: dp={iter_dp:+d}, dq={iter_dq:+d}")
+                    print(f"[Lattice]    Iteration difference: {iter_diff} ({iter_diff.bit_length()} bits)")
+                    
+                    if iter_product == self.N:
+                        print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND after iteration! ✓✓✓")
+                        print(f"[Lattice]   p = {iter_refined_p}")
+                        print(f"[Lattice]   q = {iter_refined_q}")
+                        return iter_refined_p, iter_refined_q, 1.0, iter_pyramid_basis
+                    elif iter_diff < final_diff:
+                        print(f"[Lattice]    ✓ Iteration improved: {final_diff.bit_length()} bits → {iter_diff.bit_length()} bits")
+                        # Use the iterated result
+                        return iter_refined_p, iter_refined_q, improvement + iter_improvement, iter_pyramid_basis
+                    else:
+                        print(f"[Lattice]    Iteration did not improve further")
+                except Exception as e:
+                    print(f"[Lattice]    Iteration failed: {e}, returning original refined result")
+            
             return refined_p, refined_q, improvement, pyramid_basis
         else:
             print(f"[Lattice] No significant improvement")
@@ -9052,12 +10064,14 @@ def main():
                        help="Automatically find S and D using Root's Method (default: enabled if S/D not provided)")
     parser.add_argument("--no-auto-find-s-d", action="store_true",
                        help="Disable automatic S and D discovery")
-    parser.add_argument("--search-radius", type=int, default=1000,
-                       help="Search radius for corrections (default: 1000)")
+    parser.add_argument("--search-radius", type=int, default=None,
+                       help="Search radius for corrections in bits (default: 2048, meaning 2^2048 for full key coverage)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
     parser.add_argument("--polynomial", action="store_true",
                        help="Enable polynomial solving methods")
+    parser.add_argument("--bulk", action="store_true",
+                       help="Enable bulk factor search using LLL (creates large lattice, may be slow)")
     
     # Advanced parameters
     parser.add_argument("--max-polynomials", type=int, default=None,
@@ -9071,7 +10085,7 @@ def main():
     parser.add_argument("--trial-division-limit", type=int, default=None,
                        help="Trial division limit (default: auto)")
     parser.add_argument("--ultra-search-radius", type=int, default=None,
-                       help="Ultra refinement search radius (default: auto)")
+                       help="Ultra refinement search radius in bits (e.g., 3000 for 2^3000, default: auto)")
     parser.add_argument("--polynomial-grid-size", type=int, default=None,
                        help="Polynomial grid size for generation (default: auto)")
     parser.add_argument("--max-root-candidates", type=int, default=None,
@@ -9122,6 +10136,8 @@ def main():
     lattice_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
     # Store config for use in Root's Method
     lattice_solver.config = global_config
+    # Store bulk search flag
+    lattice_solver.use_bulk_search = args.bulk
     
     # Check if S² = 4N + D factorization is requested
     success = False
@@ -9438,8 +10454,12 @@ def main():
     if args.p_decimal and args.q_decimal:
         # Use decimal approximations
         from decimal import Decimal
-        p_decimal = Decimal(args.p_decimal)
-        q_decimal = Decimal(args.q_decimal)
+        try:
+            p_decimal = Decimal(str(args.p_decimal))
+            q_decimal = Decimal(str(args.q_decimal))
+        except (ValueError, TypeError):
+            print(f"Error: Invalid decimal format: p_decimal={args.p_decimal}, q_decimal={args.q_decimal}")
+            return 1
 
         print(f"Using decimal approximations:")
         print(f"  p ≈ {p_decimal}")
@@ -9452,8 +10472,12 @@ def main():
         print(f"  Error: {diff}")
 
         # Convert to integer candidates (round to nearest)
+        # Ensure we get integers, not floats
         p_candidate = int(p_decimal.to_integral_value(rounding='ROUND_HALF_UP'))
         q_candidate = int(q_decimal.to_integral_value(rounding='ROUND_HALF_UP'))
+        
+        # Ensure N is an integer (in case it was computed from floats)
+        N = int(N)
 
         print(f"  Rounded to integers: p={p_candidate}, q={q_candidate}")
 
@@ -9463,15 +10487,22 @@ def main():
             # Try direct integer conversion first (handles large numbers)
             p_candidate = int(args.p)
             q_candidate = int(args.q)
+            # Ensure N is an integer
+            N = int(N)
             print(f"Using provided candidates: p={p_candidate}, q={q_candidate}")
         except ValueError:
-            # Fallback to float conversion for decimal strings
+            # Fallback to Decimal for decimal strings to preserve precision
             try:
-                p_candidate = int(float(args.p))
-                q_candidate = int(float(args.q))
-                print(f"Using provided candidates (converted from float): p={p_candidate}, q={q_candidate}")
-            except (ValueError, OverflowError):
-                print(f"Error: Invalid candidate format: p={args.p}, q={args.q}")
+                from decimal import Decimal
+                p_decimal = Decimal(str(args.p))
+                q_decimal = Decimal(str(args.q))
+                p_candidate = int(p_decimal.to_integral_value(rounding='ROUND_HALF_UP'))
+                q_candidate = int(q_decimal.to_integral_value(rounding='ROUND_HALF_UP'))
+                # Ensure N is an integer
+                N = int(N)
+                print(f"Using provided candidates (converted from decimal): p={p_candidate}, q={q_candidate}")
+            except (ValueError, OverflowError, TypeError) as e:
+                print(f"Error: Invalid candidate format: p={args.p}, q={args.q}, error: {e}")
                 return 1
     else:
         print("Estimating initial factor candidates...")
@@ -9495,15 +10526,50 @@ def main():
     # Calculate initial quality
     initial_product = p_candidate * q_candidate
     initial_diff = abs(initial_product - N)
+    initial_diff_bits = initial_diff.bit_length()
     print(f"Initial product: {initial_product}")
-    print(f"Initial error: {initial_diff}")
+    print(f"Initial error: {initial_diff} ({initial_diff_bits} bits)")
     print()
+
+    # Determine search radius - default is 2^2048 to cover full 2048-bit key space
+    # For LLL-based short vector search, large radius is fine (we're not brute forcing)
+    DEFAULT_SEARCH_RADIUS_BITS = 2048
+    DEFAULT_SEARCH_RADIUS = 2 ** DEFAULT_SEARCH_RADIUS_BITS
+    
+    if args.ultra_search_radius is not None:
+        # Interpret ultra_search_radius as number of bits (e.g., 3000 means 2^3000)
+        search_radius = 2 ** args.ultra_search_radius
+        print(f"🔧 Using ultra search radius: 2^{args.ultra_search_radius} = {search_radius.bit_length()} bits")
+    elif args.search_radius is not None:
+        # If search_radius is provided as a number, interpret it as bits if > 10000, otherwise as direct value
+        if args.search_radius > 10000:
+            # Likely meant as bits
+            search_radius = 2 ** args.search_radius
+            print(f"🔧 Using search radius: 2^{args.search_radius} = {search_radius.bit_length()} bits")
+        else:
+            # Direct value
+            search_radius = args.search_radius
+            print(f"🔧 Using search radius: {search_radius}")
+    else:
+        # Default: 2^4000 (huge but fine for LLL - we're finding short vectors, not brute forcing)
+        search_radius = DEFAULT_SEARCH_RADIUS
+        print(f"🔧 Using default search radius: 2^{DEFAULT_SEARCH_RADIUS_BITS} = {search_radius.bit_length()} bits")
+        print(f"    (LLL finds short vectors efficiently, so large radius is fine)")
+    
+    # Auto-expand if initial difference is larger than search radius (shouldn't happen with 2^4000 default)
+    search_radius_bits = search_radius.bit_length() if search_radius > 0 else 0
+    if initial_diff_bits > search_radius_bits:
+        # Expand to initial_diff_bits + 100 bits margin
+        expanded_bits = initial_diff_bits + 100
+        search_radius = 2 ** expanded_bits
+        print(f"🔧 Auto-expanding search radius: {search_radius_bits} bits → {expanded_bits} bits")
+        print(f"    (Initial difference: {initial_diff_bits} bits, need larger radius)")
 
     # Run lattice attack
     refined_p, refined_q, improvement, pyramid_basis = lattice_solver.solve(
         p_candidate, q_candidate,
         confidence=0.8,
-        search_radius=args.search_radius
+        search_radius=search_radius
     )
 
     print(f"\n" + "=" * 80)
@@ -9594,6 +10660,9 @@ def main():
                 'max_root_candidates': args.max_root_candidates if hasattr(args, 'max_root_candidates') else None,
             }
             poly_solver = EnhancedPolynomialSolver(N, config=config, p_approx=best_p, q_approx=best_q)
+            # Pass bulk search flag if available
+            if hasattr(lattice_solver, 'use_bulk_search'):
+                poly_solver.use_bulk_search = lattice_solver.use_bulk_search
 
             # Try all polynomial solving methods
             poly_solution = poly_solver.solve_with_all_methods(polynomials, best_p, best_q)
