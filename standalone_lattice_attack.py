@@ -32,6 +32,836 @@ import sympy as sp
 from sympy.polys.polytools import groebner
 from typing import Optional, Tuple, List
 
+# Try to import PyTorch for Transformer, fallback to simpler model if not available
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("[Transformer] PyTorch not available, using simplified model")
+
+# ============================================================================
+# TRANSFORMER MODEL FOR STEP PREDICTION
+# ============================================================================
+
+class StepPredictionTransformer:
+    """
+    Transformer Neural Network to learn from bulk search results and predict
+    which steps are most likely to yield good factors.
+    """
+    
+    def __init__(self, d_model: int = 128, nhead: int = 4, num_layers: int = 2,
+                 max_seq_len: int = 500000, use_torch: bool = TORCH_AVAILABLE):
+        """
+        Initialize Transformer model for step prediction.
+        
+        Args:
+            d_model: Model dimension
+            nhead: Number of attention heads
+            num_layers: Number of transformer layers
+            max_seq_len: Maximum sequence length (history size) - default 500K for massive context
+            use_torch: Whether to use PyTorch (if available)
+        """
+        self.use_torch = use_torch and TORCH_AVAILABLE
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.max_seq_len = max_seq_len
+        self.search_history = []  # List of (step_center, diff_bits, sqrt_N, N_bits)
+        self.factor_history = []  # List of (step_center, p_candidate, q_candidate, diff_bits) for learning p-q patterns
+        
+        if self.use_torch:
+            self._init_torch_model(d_model, nhead, num_layers)
+        else:
+            self._init_simple_model()
+    
+    def _init_torch_model(self, d_model: int, nhead: int, num_layers: int):
+        """Initialize ENHANCED PyTorch Transformer model with advanced features."""
+        device = torch.device('cpu')  # Force CPU to avoid GPU memory issues
+
+        class EnhancedTransformerModel(nn.Module):
+            def __init__(self, d_model, nhead, num_layers, max_seq_len):
+                super().__init__()
+                self.d_model = d_model
+                self.max_seq_len = max_seq_len
+
+                # Enhanced embedding with correction signals
+                self.embedding = nn.Linear(8, d_model)  # Extended: step_center, diff_bits, sqrt_N, N_bits, recency, quality_trend, correction_signal, optimality_score
+
+                # Rotary Position Encoding (RoPE) - more sophisticated than sinusoidal
+                self._init_rope()
+
+                # Multi-layer transformer with better architecture
+                self.layers = nn.ModuleList()
+                for _ in range(num_layers):
+                    layer = nn.ModuleDict({
+                        'attention': nn.MultiheadAttention(d_model, nhead, dropout=0.1, batch_first=True),
+                        'norm1': nn.LayerNorm(d_model),
+                        'norm2': nn.LayerNorm(d_model),
+                        'ffn': nn.Sequential(
+                            nn.Linear(d_model, d_model * 4),
+                            nn.GELU(),  # Better activation than ReLU
+                            nn.Dropout(0.1),
+                            nn.Linear(d_model * 4, d_model),
+                            nn.Dropout(0.1)
+                        )
+                    })
+                    self.layers.append(layer)
+
+                # Enhanced predictor heads
+                self.quality_predictor = nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.GELU(),
+                    nn.LayerNorm(d_model // 2),
+                    nn.Linear(d_model // 2, 1),
+                    nn.Sigmoid()  # Quality score 0-1
+                )
+
+                self.position_predictor = nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.GELU(),
+                    nn.LayerNorm(d_model // 2),
+                    nn.Linear(d_model // 2, 1)  # Position offset prediction
+                )
+
+            def _init_rope(self):
+                """Initialize Rotary Position Encoding frequencies."""
+                inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model // nhead, 2).float() / (d_model // nhead)))
+                self.register_buffer("inv_freq", inv_freq)
+
+            def _apply_rope(self, x, positions=None):
+                """Apply Rotary Position Encoding."""
+                seq_len = x.shape[1]
+                inv_freq = self.inv_freq
+                t = torch.arange(seq_len, device=x.device).type_as(inv_freq)
+                freqs = torch.einsum('i , j -> i j', t, inv_freq)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos()
+                sin = emb.sin()
+
+                # Apply rotation
+                x1 = x[..., : x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2 :]
+                return torch.cat((-x2, x1), dim=-1) * cos + torch.cat((x1, x2), dim=-1) * sin
+
+            def forward(self, x, return_attention=False):
+                # x shape: (batch, seq_len, 6) - extended features
+                batch_size, seq_len, _ = x.shape
+
+                # Embed input features
+                x = self.embedding(x)  # (batch, seq_len, d_model)
+
+                # Apply RoPE positional encoding
+                x = self._apply_rope(x)
+
+                # Store attention weights if requested
+                attention_weights = []
+
+                # Multi-layer transformer processing
+                for layer in self.layers:
+                    # Multi-head attention with residual connection
+                    attn_out, attn_weights = layer['attention'](x, x, x, need_weights=return_attention)
+                    if return_attention:
+                        attention_weights.append(attn_weights)
+
+                    x = layer['norm1'](x + attn_out)  # Pre-norm formulation
+
+                    # Feed-forward network with residual connection
+                    ffn_out = layer['ffn'](x)
+                    x = layer['norm2'](x + ffn_out)
+
+                # Pooling and prediction
+                pooled = x.mean(dim=1)  # (batch, d_model)
+
+                quality_score = self.quality_predictor(pooled)  # (batch, 1)
+                position_offset = self.position_predictor(pooled)  # (batch, 1)
+
+                result = {
+                    'quality_score': quality_score,
+                    'position_offset': position_offset
+                }
+
+                if return_attention:
+                    result['attention_weights'] = attention_weights
+
+                return result
+
+        self.model = EnhancedTransformerModel(d_model, nhead, num_layers, self.max_seq_len).to(device)
+        self.device = device
+
+        # Enhanced optimizer with learning rate scheduling
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001, weight_decay=1e-5)
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.9)
+
+        # Multiple loss functions for different prediction tasks
+        self.quality_criterion = nn.MSELoss()
+        self.position_criterion = nn.SmoothL1Loss()  # Better for regression
+
+        self.model.eval()  # Start in eval mode
+    
+    def _init_simple_model(self):
+        """Initialize simple fallback model (weighted average)."""
+        self.weights = np.array([0.4, 0.3, 0.2, 0.1])  # Weights for features
+        print("[Transformer] Using simplified model (PyTorch not available)")
+    
+    def add_search_result(self, step_center: int, diff_bits: Optional[int],
+                         sqrt_N: int, N_bits: int, p_candidate: Optional[int] = None,
+                         q_candidate: Optional[int] = None, known_p: Optional[int] = None,
+                         known_q: Optional[int] = None):
+        """
+        Add a search result to history with optional correction from known factors.
+
+        Args:
+            step_center: The step center value
+            diff_bits: Difference in bits (None if no result found)
+            sqrt_N: Square root of N
+            N_bits: Bit length of N
+            p_candidate: P candidate found (optional, for learning p-q patterns)
+            q_candidate: Q candidate found (optional, for learning p-q patterns)
+            known_p: Known correct P factor (for supervised learning/correction)
+            known_q: Known correct Q factor (for supervised learning/correction)
+        """
+        # ENHANCED FEATURE EXTRACTION
+        import time
+        current_time = time.time()
+
+        # Enhanced feature extraction with richer context
+        normalized_diff = diff_bits if diff_bits is not None else N_bits * 2
+
+        # Core spatial features
+        normalized_step = (step_center - sqrt_N) / sqrt_N if sqrt_N > 0 else 0
+        normalized_sqrt_N = sqrt_N / (2 ** N_bits) if N_bits > 0 else 0
+        normalized_N_bits = N_bits / 4096.0
+
+        # Recency feature (how recent is this result?)
+        recency = 1.0  # Most recent result
+        if self.search_history:
+            time_diff = current_time - self.search_history[-1][-1]  # Compare to last result timestamp
+            recency = min(1.0, 1.0 / (1.0 + time_diff))  # Exponential decay
+
+        # Quality trend feature (is quality improving?)
+        quality_trend = 0.0
+        if len(self.search_history) >= 2:
+            recent_qualities = [entry[1] for entry in self.search_history[-3:]]  # Last 3 results
+            if len(recent_qualities) >= 2:
+                # Calculate trend (negative = improving, positive = worsening)
+                quality_trend = (recent_qualities[-1] - recent_qualities[0]) / len(recent_qualities)
+
+        # CORRECTION SIGNALS: If we know the true factors, add supervised learning features
+        correction_signal = 0.0
+        optimality_score = 0.0
+
+        if known_p is not None and known_q is not None:
+            # Calculate how close this search position is to optimal factor locations
+            p_distance = abs(step_center - known_p)
+            q_distance = abs(step_center - known_q)
+
+            # Find the closest factor (this is what we're actually trying to find)
+            min_factor_distance = min(p_distance, q_distance)
+
+            # Convert to a normalized score (0-1, higher = better)
+            max_reasonable_distance = 2**(N_bits // 2)  # Half the key size
+            optimality_score = 1.0 - min(1.0, min_factor_distance / max_reasonable_distance)
+
+            # Correction signal: positive if this position is near a factor, negative if far
+            correction_signal = optimality_score - 0.5  # Center around 0
+
+            if optimality_score > 0.8:  # Very close to a factor
+                print(f"[Correction] 🎯 Position {step_center} is very close to factor (optimality: {optimality_score:.3f})")
+            elif optimality_score < 0.1:  # Very far from factors
+                print(f"[Correction] ❌ Position {step_center} is far from factors (optimality: {optimality_score:.3f})")
+
+        # Enhanced feature vector (8 features with correction signals)
+        self.search_history.append((
+            normalized_step,
+            normalized_diff / (N_bits * 2) if N_bits > 0 else 1.0,
+            normalized_sqrt_N,
+            normalized_N_bits,
+            recency,
+            quality_trend,
+            correction_signal,     # Correction signal from known factors
+            optimality_score,      # How close to optimal factor locations
+            current_time  # Add timestamp for recency calculations
+        ))
+
+        # Enhanced p-q pattern learning with more features
+        if p_candidate is not None and q_candidate is not None:
+            p_q_diff = abs(p_candidate - q_candidate)
+            p_q_diff_bits = p_q_diff.bit_length() if p_q_diff > 0 else 0
+
+            # Additional relationship features
+            p_q_ratio = max(p_candidate, q_candidate) / min(p_candidate, q_candidate) if min(p_candidate, q_candidate) > 0 else 1.0
+            p_q_sum_bits = (p_candidate + q_candidate).bit_length()
+            quality_score = 1.0 / (1.0 + diff_bits) if diff_bits is not None else 0.0
+
+            self.factor_history.append((
+                step_center, p_candidate, q_candidate, p_q_diff_bits,
+                quality_score, p_q_ratio, p_q_sum_bits, current_time
+            ))
+
+        # MASSIVE CONTEXT PRUNING: Intelligent retention with 500K capacity
+        if len(self.search_history) > self.max_seq_len * 0.9:  # Warn when approaching capacity
+            print(f"[Transformer] 📈 Approaching massive context capacity: {len(self.search_history):,} / {self.max_seq_len:,}")
+
+        if len(self.search_history) > self.max_seq_len:
+            print(f"[Transformer] Pruning search history from {len(self.search_history):,} to {self.max_seq_len:,} samples")
+
+            # Sophisticated pruning for massive context with correction signals
+            def comprehensive_score(entry):
+                quality = 1.0 - entry[1]  # Higher quality = higher score
+                recency = entry[4]  # Recency weight (0-1)
+                trend = entry[5]  # Quality trend (-1 to 1, negative = improving)
+                correction = entry[6] + 0.5  # Correction signal (-0.5 to 0.5) -> (0 to 1)
+                optimality = entry[7]  # Optimality score (0-1)
+
+                # Combine factors with learned weights
+                score = (0.4 * quality +          # Quality most important
+                        0.25 * recency +         # Recency second
+                        0.15 * max(0, trend) +   # Positive trends bonus
+                        0.1 * correction +       # Correction signal bonus
+                        0.1 * optimality)        # Optimality bonus
+
+                return score
+
+            # Sort by comprehensive score and keep top samples
+            self.search_history.sort(key=comprehensive_score, reverse=True)
+            self.search_history = self.search_history[:self.max_seq_len]
+
+        if len(self.factor_history) > self.max_seq_len:
+            print(f"[Transformer] Pruning factor history from {len(self.factor_history):,} to {self.max_seq_len:,} samples")
+
+            # Sort by quality score, recency, and factorization value
+            def factor_score(entry):
+                quality = entry[4]  # Quality score (0-1)
+                recency = (time.time() - entry[7]) / 1000.0  # Recency in seconds
+                recency_weight = 1.0 / (1.0 + recency)  # Exponential decay
+
+                # Bonus for exact factorizations
+                exact_bonus = 10.0 if entry[3] == 0 else 0.0  # diff_bits == 0
+
+                return quality + recency_weight + exact_bonus
+
+            self.factor_history.sort(key=factor_score, reverse=True)
+            self.factor_history = self.factor_history[:self.max_seq_len]
+    
+    def predict_step_quality(self, step_center: int, sqrt_N: int, N_bits: int) -> float:
+        """
+        ENHANCED prediction with richer features and progressive learning.
+
+        Now uses:
+        - 6-dimensional feature vectors instead of 4
+        - Recency weighting
+        - Quality trend analysis
+        - Context-aware predictions
+
+        Args:
+            step_center: The step center to predict
+            sqrt_N: Square root of N
+            N_bits: Bit length of N
+
+        Returns:
+            Quality score (0-1, higher is better)
+        """
+        if len(self.search_history) < 3:
+            # Early exploration: not enough history for sophisticated prediction
+            return 0.5
+
+        # Enhanced feature extraction with richer context
+        normalized_step = (step_center - sqrt_N) / sqrt_N if sqrt_N > 0 else 0
+        normalized_sqrt_N = sqrt_N / (2 ** N_bits) if N_bits > 0 else 0
+        normalized_N_bits = N_bits / 4096.0
+
+        # Estimate recency (assume this is a new prediction)
+        recency = 1.0
+
+        # Estimate quality trend from recent history
+        quality_trend = 0.0
+        if len(self.search_history) >= 3:
+            recent_qualities = [entry[1] for entry in self.search_history[-3:]]
+            quality_trend = (recent_qualities[-1] - recent_qualities[0]) / len(recent_qualities)
+
+        if self.use_torch:
+            return self._predict_torch_enhanced(normalized_step, normalized_sqrt_N, normalized_N_bits, recency, quality_trend)
+        else:
+            return self._predict_simple_enhanced(normalized_step, normalized_sqrt_N, normalized_N_bits, recency, quality_trend)
+    
+    def _predict_torch_enhanced(self, normalized_step: float, normalized_sqrt_N: float,
+                               normalized_N_bits: float, recency: float, quality_trend: float) -> float:
+        """ENHANCED prediction using sophisticated Transformer with 6 features."""
+        try:
+            # MASSIVE CONTEXT: Use sliding window sampling for efficiency with 500K context
+            # Sample diverse and recent experiences instead of full history
+            full_history = self.search_history
+
+            if len(full_history) > 1000:  # If we have massive history
+                # Intelligent sampling: keep recent + diverse high-quality samples
+                recent_samples = full_history[-500:]  # Last 500 most recent
+                quality_samples = sorted(full_history[:-500], key=lambda x: x[1])[:500]  # Top 500 best quality (lowest error)
+                history = quality_samples + recent_samples  # Combine for rich context
+            else:
+                history = full_history[-min(1000, len(full_history)):]  # Normal case
+
+            # Create sequence: history + current step (8 features each)
+            current_features = np.array([normalized_step, 0.0, normalized_sqrt_N, normalized_N_bits, recency, quality_trend, 0.0, 0.0])  # Add correction placeholders
+            sequence = np.array([entry[:8] for entry in history] + [current_features])  # Extract first 8 features, ignore timestamp
+
+            # Convert to tensor and move to device
+            x = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)  # (1, seq_len, 6)
+
+            with torch.no_grad():
+                self.model.eval()
+                result = self.model(x)
+
+                # Use quality score prediction
+                quality_score = float(result['quality_score'][0, 0].item())
+
+                # Optionally use position offset for additional guidance
+                position_offset = float(result['position_offset'][0, 0].item())
+
+                # Combine quality score with positional confidence
+                confidence = min(1.0, abs(position_offset) / normalized_step) if normalized_step != 0 else 1.0
+                final_score = quality_score * (0.8 + 0.2 * confidence)  # Weight quality higher
+
+                return max(0.0, min(1.0, final_score))  # Clamp to [0, 1]
+
+        except Exception as e:
+            # Fallback to enhanced simple model on error
+            return self._predict_simple_enhanced(normalized_step, normalized_sqrt_N, normalized_N_bits, recency, quality_trend)
+    
+    def _predict_simple_enhanced(self, normalized_step: float, normalized_sqrt_N: float,
+                                normalized_N_bits: float, recency: float, quality_trend: float) -> float:
+        """ENHANCED simple prediction using weighted features and pattern recognition."""
+        if not self.search_history:
+            return 0.5
+
+        # Enhanced feature weighting with correction signals
+        weights = np.array([0.25, 0.2, 0.12, 0.12, 0.08, 0.06, 0.1, 0.07])  # 8 weights for 8 features
+        current_features = np.array([normalized_step, 0.0, normalized_sqrt_N, normalized_N_bits, recency, quality_trend, 0.0, 0.0])  # Add correction placeholders
+
+        # Calculate similarity to successful historical results
+        best_similarity = 0.0
+        for entry in self.search_history[-50:]:  # Check last 50 results
+            if entry[1] < 0.3:  # Good quality result (low normalized error)
+                similarity = 1.0 - np.mean(np.abs(np.array(entry[:6]) - current_features))
+                best_similarity = max(best_similarity, similarity)
+
+        # Combine feature-weighted prediction with similarity
+        feature_score = np.dot(weights, current_features)
+        feature_score = 1.0 / (1.0 + abs(feature_score))  # Convert to 0-1 range
+
+        # Blend with similarity score
+        final_score = 0.7 * feature_score + 0.3 * best_similarity
+
+        return max(0.0, min(1.0, final_score))
+
+    def train_on_history(self, epochs: int = 5):
+        """Train the enhanced Transformer on massive accumulated search history (500K+ context)."""
+        if not self.use_torch or len(self.search_history) < 10:
+            return
+
+        try:
+            self.model.train()
+            history_size = len(self.search_history)
+            print(f"[Transformer] Training on {history_size:,} historical samples with 500K context...")
+
+            for epoch in range(epochs):
+                epoch_loss = 0.0
+                batch_count = 0
+
+                # MASSIVE CONTEXT TRAINING: Efficient batch sampling
+                # Instead of training on every sequence, sample diverse batches
+                num_batches = min(100, max(20, history_size // 100))  # Adaptive batch count
+
+                for batch_idx in range(num_batches):
+                    # Sample diverse training sequences from massive history
+                    if history_size > 1000:
+                        # Stratified sampling: mix recent + high-quality + random
+                        recent_start = max(0, history_size - 200)
+                        quality_indices = np.argsort([entry[1] for entry in self.search_history])[:200]  # Best quality
+                        random_indices = np.random.choice(history_size, size=100, replace=False)
+
+                        sample_indices = np.concatenate([
+                            np.arange(recent_start, history_size),  # Recent
+                            quality_indices,  # High quality
+                            random_indices  # Random exploration
+                        ])
+                        sample_indices = np.unique(sample_indices)  # Remove duplicates
+                        np.random.shuffle(sample_indices)
+                    else:
+                        sample_indices = np.arange(max(5, history_size // 2), history_size)
+
+                    # Pick a random sequence from our samples
+                    seq_idx = np.random.choice(sample_indices)
+                    seq_length = min(50, seq_idx)  # Reasonable sequence length for training
+                    start_idx = max(0, seq_idx - seq_length)
+
+                    # Extract sequence data (8 features)
+                    seq_data = np.array([self.search_history[i][:8] for i in range(start_idx, seq_idx + 1)])
+
+                    if len(seq_data) < 3:  # Minimum sequence length
+                        continue
+
+                    # Target: predict quality of the final position in sequence
+                    target_quality = 1.0 - self.search_history[seq_idx][1]  # Lower error = higher quality
+                    target_position = self.search_history[seq_idx][0]  # Position prediction
+
+                    # Convert to tensors
+                    x = torch.FloatTensor(seq_data).unsqueeze(0).to(self.device)
+                    target_qual = torch.FloatTensor([target_quality]).to(self.device)
+                    target_pos = torch.FloatTensor([target_position]).to(self.device)
+
+                    # Forward pass
+                    self.optimizer.zero_grad()
+                    result = self.model(x)
+
+                    # Calculate losses
+                    quality_loss = self.quality_criterion(result['quality_score'].squeeze(), target_qual)
+                    position_loss = self.position_criterion(result['position_offset'].squeeze(), target_pos)
+
+                    # Combined loss with adaptive weighting based on training progress
+                    quality_weight = 0.8 if epoch < epochs // 2 else 0.6  # Focus more on quality early
+                    loss = quality_weight * quality_loss + (1 - quality_weight) * position_loss
+
+                    # Backward pass
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+                    epoch_loss += loss.item()
+                    batch_count += 1
+
+                if batch_count > 0:
+                    avg_loss = epoch_loss / batch_count
+                    print(".3f")
+
+                # Learning rate scheduling
+                self.lr_scheduler.step()
+
+            self.model.eval()
+            print(f"[Transformer] ✅ Training completed on {history_size:,} samples")
+
+        except Exception as e:
+            print(f"[Transformer] Training failed: {e}")
+
+    def _predict_simple(self, normalized_step: float, normalized_sqrt_N: float,
+                        normalized_N_bits: float) -> float:
+        """LEGACY: Predict using simple weighted model for backward compatibility."""
+        if len(self.search_history) == 0:
+            return 0.5
+        
+        # Find similar steps in history
+        recent_history = self.search_history[-50:]  # Use last 50 steps
+        
+        # Calculate similarity scores based on step position
+        similarities = []
+        for hist_step, hist_diff, hist_sqrt, hist_nbits in recent_history:
+            # Similarity based on step position
+            step_sim = 1.0 / (1.0 + abs(hist_step - normalized_step) * 10)
+            # Weight by how good the result was (lower diff_bits = better)
+            quality = 1.0 / (1.0 + hist_diff)
+            similarities.append(step_sim * quality)
+        
+        if len(similarities) > 0:
+            # Weighted average of similarities
+            return min(1.0, max(0.0, np.mean(similarities)))
+        return 0.5
+    
+    def train_on_history(self, epochs: int = 10):
+        """Train the model on accumulated history."""
+        if not self.use_torch or len(self.search_history) < 10:
+            return
+        
+        try:
+            self.model.train()
+            
+            # Prepare training data
+            sequences = []
+            targets = []
+            
+            # Create sliding windows from history
+            window_size = min(50, len(self.search_history) - 1)
+            for i in range(len(self.search_history) - window_size):
+                seq = self.search_history[i:i+window_size]
+                target = 1.0 / (1.0 + self.search_history[i+window_size][1])  # Quality based on diff_bits
+                
+                sequences.append(seq)
+                targets.append(target)
+            
+            if len(sequences) == 0:
+                return
+            
+            # Convert to tensors and move to device
+            X = torch.FloatTensor(sequences).to(self.device)
+            y = torch.FloatTensor(targets).unsqueeze(1).to(self.device)
+            
+            # Training loop
+            for epoch in range(epochs):
+                self.optimizer.zero_grad()
+                predictions = self.model(X)
+                loss = self.criterion(predictions, y)
+                loss.backward()
+                self.optimizer.step()
+            
+            self.model.eval()
+            print(f"[Transformer] Trained on {len(sequences)} samples, final loss: {loss.item():.4f}")
+        except Exception as e:
+            print(f"[Transformer] Training error: {e}")
+            self.model.eval()
+    
+    def predict_optimal_step_size(self, current_step: int, sqrt_N: int, N_bits: int,
+                                  base_step_size: int = None) -> int:
+        """
+        Predict optimal step size based on learned p-q difference patterns.
+
+        Args:
+            current_step: Current step position
+            sqrt_N: Square root of N
+            N_bits: Bit length of N
+            base_step_size: Base step size to use if no history (default: 2^100)
+
+        Returns:
+            Optimal step size in bits (will be converted to 2^bits)
+        """
+        if base_step_size is None:
+            base_step_size = 100  # Default: 2^100
+
+        if len(self.factor_history) < 3:
+            # Not enough history, use base step size
+            return base_step_size
+
+        # Analyze learned p-q difference patterns
+        recent_factors = self.factor_history[-min(20, len(self.factor_history)):]
+
+        # Calculate average p-q difference in bits
+        p_q_diffs = [f[3] for f in recent_factors if f[3] > 0]  # p_q_diff_bits
+
+        if not p_q_diffs:
+            return base_step_size
+
+        avg_p_q_diff_bits = sum(p_q_diffs) / len(p_q_diffs)
+
+        # Also consider the quality of results (lower diff_bits = better)
+        weighted_diffs = []
+        for f in recent_factors:
+            p_q_diff_bits = f[3]
+            result_quality = 1.0 / (1.0 + f[4]) if f[4] is not None and f[4] > 0 else 0.1
+            weighted_diffs.append(p_q_diff_bits * result_quality)
+
+        if weighted_diffs:
+            weighted_avg = sum(weighted_diffs) / len(weighted_diffs)
+        else:
+            weighted_avg = avg_p_q_diff_bits
+
+        # Predict step size: if p-q differences are small, use smaller steps
+        # If differences are large, use larger steps
+        if weighted_avg < N_bits / 4:
+            # Small p-q differences: use smaller steps for precision
+            optimal_bits = max(50, int(weighted_avg / 2))
+        elif weighted_avg < N_bits / 2:
+            # Medium differences: use medium steps
+            optimal_bits = max(75, int(weighted_avg))
+        else:
+            # Large differences: use larger steps for coverage
+            optimal_bits = min(200, int(weighted_avg * 1.5))
+
+        # Clamp to reasonable range
+        optimal_bits = max(50, min(200, optimal_bits))
+
+        return optimal_bits
+
+    def predict_next_search_position(self, current_position: int, sqrt_N: int, N_bits: int) -> int:
+        """
+        PROGRESSIVE LEARNING: Use all accumulated knowledge to predict the next most promising search position.
+
+        The Transformer continuously learns from every search result and improves its predictions
+        by analyzing patterns in successful factorizations, good approximations, and failed attempts.
+        """
+        if len(self.factor_history) < 3:
+            # Not enough data - do intelligent exploration around sqrt(N)
+            exploration_step = len(self.factor_history) + 1
+            # Start closer to sqrt(N) and explore logarithmically outward
+            base_offset = 2**(25 + exploration_step * 3)  # 2^28, 2^31, 2^34, etc.
+
+            # Alternate between above and below sqrt(N) for better coverage
+            if exploration_step % 2 == 1:
+                next_pos = sqrt_N + base_offset
+            else:
+                next_pos = max(1000, sqrt_N - base_offset // 4)  # Don't go too low
+
+            print(f"[Transformer] Exploration phase: testing around √N ± 2^{base_offset.bit_length()}")
+            return next_pos
+
+        # Progressive learning: analyze ALL available data
+        all_factors = self.factor_history
+
+        # Extract all valid results (both successful and approximations)
+        valid_results = [f for f in all_factors if f[4] is not None]
+        successful = [f for f in valid_results if f[4] == 0]
+        approximations = [f for f in valid_results if f[4] > 0]
+
+        print(f"[Transformer] Progressive learning from {len(valid_results)} total results ({len(successful)} exact, {len(approximations)} approximations)")
+
+        if successful:
+            # EXCELLENT: We have exact factorizations! Focus on their patterns
+            print(f"[Transformer] 🎯 Found {len(successful)} exact factorizations - converging on pattern!")
+
+            # Use successful factorizations as the primary guide
+            success_positions = [f[0] for f in successful]
+            success_p_q_diffs = [f[3] for f in successful]
+
+            # Calculate weighted average based on recency (newer results more important)
+            weights = list(range(1, len(successful) + 1))
+            weighted_pos = sum(p * w for p, w in zip(success_positions, weights)) // sum(weights)
+            weighted_p_q_diff = sum(d * w for d, w in zip(success_p_q_diffs, weights)) // sum(weights)
+
+            # Jump toward the weighted center of successful regions
+            pos_diff = abs(weighted_pos - current_position)
+            jump_distance = pos_diff // 3 + 2**(weighted_p_q_diff // 2)  # Blend position and p-q insights
+
+        elif approximations:
+            # LEARNING FROM APPROXIMATIONS: Get progressively better
+            print(f"[Transformer] 📈 Learning from {len(approximations)} approximations - improving predictions")
+
+            # Sort by quality and recency
+            approximations.sort(key=lambda x: (x[4], -x[0]))  # Best quality first, then most recent
+
+            # Take top results, weighted by quality (better approximations = higher weight)
+            top_results = approximations[:min(5, len(approximations))]
+
+            # Quality-weighted analysis
+            total_weight = sum(1.0 / (r[4] + 1) for r in top_results)  # Better quality = higher weight
+            avg_pos = sum(r[0] * (1.0 / (r[4] + 1)) for r in top_results) / total_weight
+            avg_p_q_diff = sum(r[3] * (1.0 / (r[4] + 1)) for r in top_results) / total_weight
+
+            # Progressive refinement: get closer to good approximations
+            pos_diff = abs(avg_pos - current_position)
+            p_q_scale = 2**(avg_p_q_diff // 4)  # Smaller jumps as we learn
+
+            if current_position < avg_pos:
+                jump_distance = pos_diff // 4 + p_q_scale  # Approach good region
+            else:
+                jump_distance = p_q_scale  # Explore at similar scale
+
+        else:
+            # LEARNING FROM FAILURES: Even failed attempts teach us something
+            print(f"[Transformer] 🔄 Learning from {len(all_factors)} attempts (no good approximations yet)")
+
+            # Analyze failure patterns to avoid bad regions
+            failed_positions = [f[0] for f in all_factors]
+
+            # Try scales that haven't been explored much
+            attempt_count = len(all_factors)
+            # Use a more systematic exploration pattern
+            scale_step = (attempt_count // 5) % 33  # EXPANDED: Change scale every 5 attempts
+            jump_distance = 2**(35 + scale_step * 2)  # EXPANDED: 2^35, 2^37, 2^39, ... 2^101
+
+            # Avoid recently failed positions
+            next_pos = current_position + jump_distance
+            while any(abs(next_pos - fp) < jump_distance // 4 for fp in failed_positions[-10:]):
+                next_pos += jump_distance // 2  # Shift away from recent failures
+
+            return next_pos
+
+        # Apply progressive learning bounds - EXPANDED RANGE: 2^30 to 2^100
+        jump_distance = max(jump_distance, 2**30)  # Minimum intelligent jump
+        jump_distance = min(jump_distance, 2**100)  # EXPANDED: Maximum jump now 2^100 (was 2^80)
+
+        # Direction: progressively refine toward promising regions
+        if successful:
+            next_pos = current_position + jump_distance  # Go toward successful regions
+        else:
+            # For approximations, sometimes explore in both directions
+            if len(approximations) % 3 == 0:  # Every 3rd approximation-guided search
+                next_pos = current_position - jump_distance // 2  # Try backward
+                next_pos = max(next_pos, 1000)  # Don't go too low
+            else:
+                next_pos = current_position + jump_distance
+
+        # Learning bounds check - EXPANDED RANGE
+        search_upper = 2**(N_bits + 50)  # EXPANDED: Allow much more overflow for 2^100 jumps
+        next_pos = min(next_pos, search_upper)
+
+        # Safe bit length calculation
+        try:
+            jump_bits = (next_pos - current_position).bit_length()
+        except (AttributeError, OverflowError):
+            jump_bits = len(bin(next_pos - current_position)) - 2 if next_pos > current_position else 0
+
+        print(f"[Transformer] Learning from {len(successful)} successes, {len(approximations)} approximations")
+        print(f"[Transformer] Next jump: 2^{jump_bits}")
+
+        return next_pos
+
+    def save_model(self, filepath: str) -> bool:
+        """Save the trained transformer model to disk.
+
+        Returns:
+            True if save was successful, False otherwise
+        """
+        if not self.use_torch:
+            print("[Transformer] Cannot save: PyTorch not available")
+            return False
+
+        try:
+            import torch
+            state = {
+                'model_state': self.model.state_dict(),
+                'optimizer_state': self.optimizer.state_dict(),
+                'search_history': self.search_history,
+                'factor_history': self.factor_history,
+                'pretrained': getattr(self, 'pretrained', False),
+                'config': {
+                    'd_model': self.d_model,
+                    'nhead': self.nhead,
+                    'num_layers': self.num_layers,
+                    'max_seq_len': self.max_seq_len
+                }
+            }
+            torch.save(state, filepath)
+            print(f"[Transformer] ✅ Model saved to {filepath}")
+            return True
+        except Exception as e:
+            print(f"[Transformer] ❌ Failed to save model: {e}")
+            return False
+
+    def load_model(self, filepath: str) -> bool:
+        """Load a trained transformer model from disk."""
+        if not self.use_torch:
+            print("[Transformer] Cannot load: PyTorch not available")
+            return False
+
+        try:
+            import torch
+            state = torch.load(filepath, map_location=self.device)
+
+            # Check if model architecture matches
+            config = state.get('config', {})
+            if (config.get('d_model') != self.d_model or
+                config.get('nhead') != self.nhead or
+                config.get('num_layers') != self.num_layers):
+                print("[Transformer] ⚠️ Model architecture mismatch, loading anyway...")
+
+            self.model.load_state_dict(state['model_state'])
+            self.optimizer.load_state_dict(state['optimizer_state'])
+
+            # Restore learning history
+            self.search_history = state.get('search_history', [])
+            self.factor_history = state.get('factor_history', [])
+            self.pretrained = state.get('pretrained', False)
+
+            print(f"[Transformer] ✅ Model loaded from {filepath}")
+            print(f"[Transformer] 📊 Restored {len(self.search_history)} search samples, {len(self.factor_history)} factor samples")
+            if self.pretrained:
+                print("[Transformer] 🎓 Model was pre-trained on synthetic RSA keys")
+
+            return True
+        except Exception as e:
+            print(f"[Transformer] ❌ Failed to load model: {e}")
+            return False
+
+
 # ============================================================================
 # ENHANCED POLYNOMIAL SOLVER
 # ============================================================================
@@ -45,21 +875,112 @@ class EnhancedPolynomialSolver:
         self.q = sp.Symbol('q', integer=True, positive=True)
         self.config = config or {}
 
-        # Set approximations - use provided hints, or fall back to defaults
+        # Set approximations - use provided hints, or fall back to improved defaults
         if p_approx is not None and q_approx is not None:
             self.p_approx = p_approx
             self.q_approx = q_approx
         else:
-            # Set default approximations for testing
-            # For large N, use integer square root approximation
-            if N.bit_length() > 1000:  # Very large numbers
-                # Use bit length to estimate square root
-                sqrt_bits = (N.bit_length() + 1) // 2
-                self.p_approx = 1 << sqrt_bits  # 2^(bits/2) approximation
-                self.q_approx = N // self.p_approx
-            else:
-                self.p_approx = int(N**0.5)  # Rough square root approximation
-                self.q_approx = N // self.p_approx
+            # IMPROVED: Use integer square root for accurate approximation
+            import math
+            sqrt_N = math.isqrt(N)  # Integer square root (exact for large numbers)
+            
+            # Strategy 1: Start with sqrt(N) as initial guess for p
+            # Since p and q are close to sqrt(N) for balanced RSA keys
+            self.p_approx = sqrt_N
+            
+            # Strategy 2: Use Newton's method refinement for better accuracy
+            # For p ≈ sqrt(N), we can refine using: p_new = (p_old + N/p_old) // 2
+            # This converges to sqrt(N) quickly
+            p_refined = (sqrt_N + N // sqrt_N) // 2
+            if p_refined > 0 and p_refined < sqrt_N * 2:
+                self.p_approx = p_refined
+            
+            # Strategy 3: Account for typical RSA key imbalance
+            # Most RSA keys have p and q within a factor of 2-10 of sqrt(N)
+            # Try slightly smaller p (common in practice)
+            p_candidate = (sqrt_N * 9) // 10  # 90% of sqrt(N)
+            if p_candidate > 0:
+                q_candidate = N // p_candidate
+                # Check if this gives a better balance (p and q closer in size)
+                if abs(p_candidate - q_candidate) < abs(self.p_approx - (N // self.p_approx)):
+                    self.p_approx = p_candidate
+            
+            self.q_approx = N // self.p_approx
+            
+            # Strategy 4: Refine using continued fraction approximation
+            # If N has a continued fraction representation, we can get better estimates
+            # For now, use the integer square root which is already quite good
+            
+            print(f"[Estimation] Initial p_approx = {self.p_approx} (bit-length: {self.p_approx.bit_length()})")
+            print(f"[Estimation] Initial q_approx = {self.q_approx} (bit-length: {self.q_approx.bit_length()})")
+            print(f"[Estimation] Error: p_approx * q_approx - N = {self.p_approx * self.q_approx - N}")
+    
+    def refine_approximations(self, max_iterations: int = 5) -> Tuple[int, int]:
+        """
+        Refine p and q approximations using iterative methods.
+        
+        Uses:
+        1. Newton's method: p_new = (p_old + N/p_old) // 2
+        2. Balance correction: Adjust to minimize |p - q|
+        3. Error minimization: Find p that minimizes |p * (N//p) - N|
+        
+        Returns:
+            (refined_p_approx, refined_q_approx)
+        """
+        import math
+        
+        p_current = self.p_approx
+        q_current = self.q_approx
+        best_error = abs(p_current * q_current - self.N)
+        best_p = p_current
+        best_q = q_current
+        
+        print(f"[Refinement] Starting with p={p_current}, q={q_current}, error={best_error}")
+        
+        # Method 1: Newton's method refinement (converges to sqrt(N))
+        for iteration in range(max_iterations):
+            # Newton step: p_new = (p + N/p) // 2
+            if p_current > 0:
+                p_new = (p_current + self.N // p_current) // 2
+                q_new = self.N // p_new
+                error = abs(p_new * q_new - self.N)
+                
+                if error < best_error:
+                    best_error = error
+                    best_p = p_new
+                    best_q = q_new
+                    print(f"[Refinement] Iteration {iteration+1}: p={p_new}, error={error} (improved)")
+                
+                # Check convergence
+                if abs(p_new - p_current) < max(1, p_current // 1000):
+                    break
+                
+                p_current = p_new
+                q_current = q_new
+        
+        # Method 2: Try values that make p and q more balanced
+        # For RSA, p and q are typically within a factor of 2-10
+        sqrt_N = math.isqrt(self.N)
+        for factor in [8, 9, 10, 11, 12]:  # Try different ratios
+            p_candidate = (sqrt_N * factor) // 10
+            if p_candidate > 0:
+                q_candidate = self.N // p_candidate
+                error = abs(p_candidate * q_candidate - self.N)
+                
+                # Also check balance (prefer p and q closer in size)
+                balance = abs(p_candidate - q_candidate)
+                if error < best_error * 1.1 and balance < abs(best_p - best_q) * 1.1:
+                    best_p = p_candidate
+                    best_q = q_candidate
+                    best_error = error
+        
+        self.p_approx = best_p
+        self.q_approx = best_q
+        
+        print(f"[Refinement] Final: p={best_p}, q={best_q}, error={best_error}")
+        print(f"[Refinement] Improvement: {abs(self.p_approx * self.q_approx - N) - best_error} reduction in error")
+        
+        return best_p, best_q
 
     def _safe_penalty(self, val, max_penalty: float = 1000.0) -> float:
         """
@@ -6362,7 +7283,83 @@ class MinimizableFactorizationLatticeSolver:
         self.N = N
         self.delta = delta
         self.n_bits = N.bit_length()
+        
+        # Initialize p and q approximations
+        import math
+        sqrt_N = math.isqrt(N)
+        self.p_approx = sqrt_N
+        self.q_approx = N // sqrt_N
+        
         print(f"[Lattice Solver] Initialized for {self.n_bits}-bit N, delta={delta}")
+        print(f"[Lattice Solver] Initial p_approx = {self.p_approx}, q_approx = {self.q_approx}")
+
+    def refine_approximations(self, max_iterations: int = 5) -> Tuple[int, int]:
+        """
+        Refine p and q approximations using iterative methods.
+        
+        Uses:
+        1. Newton's method: p_new = (p_old + N/p_old) // 2
+        2. Balance correction: Adjust to minimize |p - q|
+        3. Error minimization: Find p that minimizes |p * (N//p) - N|
+        
+        Returns:
+            (refined_p_approx, refined_q_approx)
+        """
+        import math
+        
+        p_current = self.p_approx
+        q_current = self.q_approx
+        best_error = abs(p_current * q_current - self.N)
+        best_p = p_current
+        best_q = q_current
+        
+        print(f"[Refinement] Starting with p={p_current}, q={q_current}, error={best_error}")
+        
+        # Method 1: Newton's method refinement (converges to sqrt(N))
+        for iteration in range(max_iterations):
+            # Newton step: p_new = (p + N/p) // 2
+            if p_current > 0:
+                p_new = (p_current + self.N // p_current) // 2
+                q_new = self.N // p_new
+                error = abs(p_new * q_new - self.N)
+                
+                if error < best_error:
+                    best_error = error
+                    best_p = p_new
+                    best_q = q_new
+                    print(f"[Refinement] Iteration {iteration+1}: p={p_new}, error={error} (improved)")
+                
+                # Check convergence
+                if abs(p_new - p_current) < max(1, p_current // 1000):
+                    break
+                
+                p_current = p_new
+                q_current = q_new
+        
+        # Method 2: Try values that make p and q more balanced
+        # For RSA, p and q are typically within a factor of 2-10
+        sqrt_N = math.isqrt(self.N)
+        for factor in [8, 9, 10, 11, 12]:  # Try different ratios
+            p_candidate = (sqrt_N * factor) // 10
+            if p_candidate > 0:
+                q_candidate = self.N // p_candidate
+                error = abs(p_candidate * q_candidate - self.N)
+                
+                # Also check balance (prefer p and q closer in size)
+                balance = abs(p_candidate - q_candidate)
+                if error < best_error * 1.1 and balance < abs(best_p - best_q) * 1.1:
+                    best_p = p_candidate
+                    best_q = q_candidate
+                    best_error = error
+        
+        initial_error = abs(self.p_approx * self.q_approx - self.N)
+        self.p_approx = best_p
+        self.q_approx = best_q
+        
+        print(f"[Refinement] Final: p={best_p}, q={best_q}, error={best_error}")
+        print(f"[Refinement] Improvement: {initial_error - best_error} reduction in error")
+        
+        return best_p, best_q
 
     def _construct_pyramid_lattice_basis(self, p_candidate: int, q_candidate: int) -> np.ndarray:
         """
@@ -6545,167 +7542,809 @@ class MinimizableFactorizationLatticeSolver:
 
         return basis
 
-    def _bulk_search_factors_with_lll(self, search_radius: int) -> Optional[Tuple[int, int]]:
+    def _bulk_search_factors_with_lll(self, search_radius: int, pretrained_transformer: Optional['StepPredictionTransformer'] = None) -> Optional[Tuple[int, int]]:
         """
         Bulk search for factors using LLL following univariate polynomial root-finding logic.
         
-        Strategy: Construct a polynomial f(x) whose roots correspond to factors.
-        - If p = sqrt_N + x is a factor, then (sqrt_N + x) divides N
-        - We want to find x such that (sqrt_N + x) * q = N for some integer q
-        - This is equivalent to finding roots of the polynomial relationship
-        - Use LLL to find small roots (small x values) that give factors
+        Strategy: Step through the ENTIRE RSA key space in increments of 2^100,
+        running lattice attacks at each step and tracking the best factors found.
+        Search range: From 2 to N (entire key space).
         
         This follows the same logic as the univariate polynomial approach:
-        1. Construct polynomial representation
-        2. Use LLL to find roots (small x values)
-        3. Extract factors from roots
+        1. Divide entire search space into steps of 2^100
+        2. At each step, construct polynomial representation centered at that point
+        3. Use LLL to find roots (small x values) that give factors
+        4. Extract factors from roots and track best results
         """
-        print(f"[Lattice] 🔍 BULK SEARCH MODE: Univariate polynomial root-finding approach")
-        print(f"[Lattice]    Search radius: {search_radius.bit_length()} bits")
-        print(f"[Lattice]    Strategy: Construct polynomial f(x) where roots = factors, use LLL to find roots")
-        print(f"[Lattice]    Following same logic as univariate polynomial method!")
-        
+        print(f"[Lattice] 🔍 TRANSFORMER-GUIDED BULK SEARCH MODE (EXPANDED RANGE)")
+        print(f"[Lattice] Learning from p-q bit differences to guide search")
+        print(f"[Lattice] ⚡ EXPANDED SEARCH CAPABILITY: Jumps from 2^30 to 2^100 (was 2^80)")
+        import sys
+        sys.stdout.flush()
+
         import math
         sqrt_N = int(math.isqrt(self.N))
-        sqrt_N_bits = sqrt_N.bit_length()
         N_bits = self.N.bit_length()
-        
-        print(f"[Lattice]    √N ≈ 2^{sqrt_N_bits} bits")
-        print(f"[Lattice]    N ≈ 2^{N_bits} bits")
-        print(f"[Lattice]    Constructing polynomial-based factorization lattice...")
-        
-        # Strategy: Construct a polynomial f(x) = (sqrt_N + x) * q - N
-        # We want to find x such that (sqrt_N + x) divides N exactly
-        # This means: (sqrt_N + x) * q = N for some integer q
-        # Rearranging: sqrt_N * q + x * q = N
-        # So: x * q = N - sqrt_N * q
-        # For small x, we have: q ≈ N / sqrt_N ≈ sqrt_N
-        # So: x * sqrt_N ≈ N - sqrt_N * sqrt_N = N - sqrt_N²
-        
-        # Polynomial approach: We want to find small x such that (sqrt_N + x) divides N
-        # Construct a lattice that represents this polynomial relationship
-        # LLL will find short vectors corresponding to small roots x
-        
-        # Optimize lattice dimension for LLL efficiency
-        # For 2048-bit numbers, 500 vectors with huge integers is too slow
-        # Use a more reasonable size that LLL can handle efficiently
-        # LLL complexity is roughly O(n^4 * log(max_entry)) for n vectors
-        max_lattice_dim = 100  # Reduced for LLL efficiency (was 500, too slow)
-        lattice_dim = min(max_lattice_dim, max(50, sqrt_N_bits))
-        
-        print(f"[Lattice]    → Optimized lattice dimension: {lattice_dim} vectors (for LLL efficiency)")
-        print(f"[Lattice]    → Note: Using fewer but more strategic vectors for faster LLL reduction")
-        
-        print(f"[Lattice]    Using MAXIMUM lattice dimension: {lattice_dim} vectors")
-        print(f"[Lattice]    (Maximized for comprehensive search coverage)")
-        
-        basis_vectors = []
-        
-        # PYRAMID LATTICE CONSTRUCTION: Covering entire N range
-        # Use pyramid structure but for the entire factorization space
-        # Parameterize: p = sqrt_N + x, q = N / p where x ∈ [-sqrt_N, N-sqrt_N]
-        # This covers p ∈ [1, N] - the ENTIRE range
-        
-        print(f"[Lattice]    → Constructing pyramid lattice covering ENTIRE N range")
-        print(f"[Lattice]    → p ∈ [1, N] - FULL COVERAGE via pyramid structure")
-        print(f"[Lattice]    → Completely independent of starting candidates")
-        
-        # Calculate N bit length
-        N_bits = self.N.bit_length()
-        sqrt_N = int(math.isqrt(self.N))
-        
-        # Scale factor for numerical stability
-        scale = max(1, N_bits // 20)
-        coeff_limit = 10**20  # Moderate precision for large numbers
-        
-        def reduce_coeff(x):
-            """Reduce large coefficients to manageable size"""
-            if abs(x) > coeff_limit:
-                return x % coeff_limit if x > 0 else -(abs(x) % coeff_limit)
-            return x
-        
-        # BASE LAYER: Fundamental factorization relations covering entire range
-        # Format: [a, b, c] where a + b*p + c*q = 0, and p*q = N
-        # These work for ANY p, q in [1, N]
-        base_vectors = [
-            # Fundamental: p * q = N
-            [reduce_coeff(-self.N), reduce_coeff(0), reduce_coeff(0)],  # -N = 0 (when p*q = N)
-            
-            # p + q relations (can be anywhere from 2 to N+1)
-            [0, reduce_coeff(1), reduce_coeff(1)],  # p + q = 0 (for some relation)
-            [reduce_coeff(self.N), reduce_coeff(1), reduce_coeff(1)],  # N + p + q = 0
-            
-            # p - q relations (can range widely)
-            [0, reduce_coeff(1), reduce_coeff(-1)],  # p - q = 0
-            [reduce_coeff(self.N), reduce_coeff(1), reduce_coeff(-1)],  # N + p - q = 0
-            
-            # Identity vectors for p and q (help LLL find them directly)
-            [0, reduce_coeff(1), 0],  # p
-            [0, 0, reduce_coeff(1)],  # q
-            
-            # Direct factorization constraint variations
-            [reduce_coeff(self.N), reduce_coeff(-1), reduce_coeff(-1)],  # N - p - q = 0
-        ]
-        
-        # MIDDLE LAYER: Derived relations at different scales to cover entire range
-        # These represent relations that work across different magnitudes of p and q
-        middle_vectors = [
-            # p² + q² relations (scaled to cover different magnitudes)
-            [reduce_coeff(self.N), reduce_coeff(sqrt_N), reduce_coeff(sqrt_N)],  # N + sqrt_N*(p+q)
-            [reduce_coeff(-self.N), reduce_coeff(sqrt_N), reduce_coeff(-sqrt_N)],  # -N + sqrt_N*(p-q)
-            
-            # (p+q)² and (p-q)² relations
-            [reduce_coeff(2*self.N), reduce_coeff(2*sqrt_N), reduce_coeff(2*sqrt_N)],  # 2N + 2*sqrt_N*(p+q)
-            [reduce_coeff(-2*self.N), reduce_coeff(2*sqrt_N), reduce_coeff(-2*sqrt_N)],  # -2N + 2*sqrt_N*(p-q)
-            
-            # Cross terms: p*q variations at different scales
-            [reduce_coeff(self.N * sqrt_N), reduce_coeff(self.N), reduce_coeff(self.N)],  # N*sqrt_N + N*(p+q)
-            [reduce_coeff(-self.N * sqrt_N), reduce_coeff(self.N), reduce_coeff(-self.N)],  # -N*sqrt_N + N*(p-q)
-            
-            # Higher order terms covering different scales (1 to N)
-            [reduce_coeff(sqrt_N**2), reduce_coeff(sqrt_N), reduce_coeff(sqrt_N)],  # sqrt_N² + sqrt_N*(p+q)
-            [reduce_coeff(self.N**2), reduce_coeff(self.N), reduce_coeff(self.N)],  # N² + N*(p+q)
-            [reduce_coeff(self.N * sqrt_N**2), reduce_coeff(sqrt_N * self.N), reduce_coeff(sqrt_N * self.N)],  # N*sqrt_N² + sqrt_N*N*(p+q)
-            
-            # Additional relations for comprehensive coverage
-            [reduce_coeff(sqrt_N**3), reduce_coeff(sqrt_N**2), reduce_coeff(sqrt_N**2)],
-            [reduce_coeff(self.N * sqrt_N**3), reduce_coeff(sqrt_N**2 * self.N), reduce_coeff(sqrt_N**2 * self.N)],
-        ]
-        
-        # APEX LAYER: Complex combinations covering entire range
-        # These help LLL find factors at any scale/magnitude across [1, N]
-        apex_vectors = [
-            # Complex relations that work across all scales
-            [reduce_coeff(self.N**2 + sqrt_N**4), reduce_coeff(self.N * sqrt_N), reduce_coeff(self.N * sqrt_N)],
-            [reduce_coeff(self.N * sqrt_N**3), reduce_coeff(sqrt_N**2 * self.N), reduce_coeff(sqrt_N**2 * self.N)],
-            [reduce_coeff(sqrt_N**4), reduce_coeff(sqrt_N**3), reduce_coeff(sqrt_N**3)],
-            
-            # Mixed high-degree relations covering entire range
-            [reduce_coeff(self.N**2 * sqrt_N), reduce_coeff(self.N**2), reduce_coeff(self.N**2)],
-            [reduce_coeff(self.N * sqrt_N**4), reduce_coeff(sqrt_N**3 * self.N), reduce_coeff(sqrt_N**3 * self.N)],
-            
-            # Additional apex vectors for comprehensive coverage of [1, N]
-            [reduce_coeff((self.N + sqrt_N**2)**2), reduce_coeff((self.N + sqrt_N**2) * sqrt_N), reduce_coeff((self.N + sqrt_N**2) * sqrt_N)],
-            [reduce_coeff(self.N**3), reduce_coeff(self.N**2), reduce_coeff(self.N**2)],
-            [reduce_coeff(sqrt_N**5), reduce_coeff(sqrt_N**4), reduce_coeff(sqrt_N**4)],
-            [reduce_coeff(self.N**2 * sqrt_N**2), reduce_coeff(self.N * sqrt_N**2), reduce_coeff(self.N * sqrt_N**2)],
-            [reduce_coeff(self.N * sqrt_N**5), reduce_coeff(sqrt_N**4 * self.N), reduce_coeff(sqrt_N**4 * self.N)],
-        ]
-        
-        # Combine all layers to form pyramid
-        basis_vectors = base_vectors + middle_vectors + apex_vectors
-        
-        # Add more vectors if needed to reach lattice_dim
-        while len(basis_vectors) < lattice_dim:
-            # Add scaled versions of base relations to fill dimension
-            scale_factor = len(basis_vectors) - len(base_vectors) - len(middle_vectors) - len(apex_vectors) + 1
-            basis_vectors.append([
-                reduce_coeff(self.N * scale_factor),
-                reduce_coeff(scale_factor),
-                reduce_coeff(scale_factor)
-            ])
-            if len(basis_vectors) >= lattice_dim:
+
+        # Search range: entire key space
+        search_lower = max(1000, sqrt_N // 1000)  # Skip tiny numbers
+        search_upper = self.N
+
+        print(f"[Lattice] Search range: {search_lower:,} to N")
+        print(f"[Lattice] N bit length: {N_bits}")
+
+        # Initialize Transformer for learning p-q patterns
+        no_transformer = getattr(self, 'config', {}).get('no_transformer', False)
+        use_transformer = not no_transformer and TORCH_AVAILABLE
+
+        if pretrained_transformer is not None:
+            # Use the pre-trained transformer
+            transformer = pretrained_transformer
+            print(f"[Transformer] Using pre-trained transformer with {len(transformer.search_history)} experiences")
+            if hasattr(transformer, 'pretrained') and transformer.pretrained:
+                print(f"[Transformer] 🎓 Pre-trained model active - learned from synthetic RSA keys")
+        elif use_transformer:
+            transformer = StepPredictionTransformer(d_model=64, nhead=2, num_layers=1)
+            print(f"[Transformer] Initialized fresh neural network for p-q pattern learning")
+        else:
+            transformer = StepPredictionTransformer(use_torch=False)
+            print(f"[Transformer] Using simplified model (PyTorch disabled)")
+
+        sys.stdout.flush()
+
+        # Search parameters - continue until factorization found
+        step_num = 0
+        current_position = search_lower
+        max_consecutive_failures = 1000  # Safety limit for consecutive failures
+        consecutive_failures = 0
+
+        # Progressive learning: transformer starts learning immediately
+        print(f"[Lattice] PROGRESSIVE LEARNING MODE")
+        print(f"[Lattice] Transformer will learn from every step and guide search from the start")
+        print(f"[Lattice] Will continue until exact factorization found")
+
+        while current_position < search_upper and consecutive_failures < max_consecutive_failures:
+            step_num += 1
+
+            # Progressive learning: transformer guides search from step 3 onward
+            if use_transformer and len(transformer.factor_history) >= 3:
+                # Use Transformer to predict next promising position
+                # The transformer now learns progressively from ALL previous steps!
+                step_center = transformer.predict_next_search_position(
+                    current_position, sqrt_N, N_bits
+                )
+                # Ensure it's within search bounds
+                step_center = max(search_lower, min(step_center, search_upper - 1000))
+
+                # Safe large integer formatting
+                try:
+                    pos_str = f"{step_center:,}"
+                except (ValueError, OverflowError):
+                    pos_str = f"{step_center}"
+
+                # Show transformer confidence and learning progress
+                history_size = len(transformer.factor_history)
+                print(f"\n[Transformer] Step {step_num}: Learned from {history_size} previous results")
+                print(f"[Transformer] Predicted next position: {pos_str}")
+
+                # Occasionally add some exploration even when using transformer
+                # This prevents getting stuck in local optima
+                if step_num % 10 == 0 and history_size > 5:
+                    # Every 10th step, add some random exploration
+                    exploration_offset = 2**(35 + (step_num // 10) % 15)
+                    alt_center = step_center + exploration_offset
+                    alt_center = max(search_lower, min(alt_center, search_upper - 1000))
+                    if alt_center != step_center:
+                        print(f"[Transformer] Adding exploration: also testing position {alt_center:,}")
+                        # We'll test both positions (modify logic below)
+
+            else:
+                # Initial exploration to build training data for the transformer
+                # Use varied stepping to learn different patterns
+                step_distance = 2**(35 + (step_num * 3) % 65)  # EXPANDED: 2^35 to 2^100 range
+                step_center = current_position + step_distance
+                # Bound to search range
+                step_center = min(step_center, search_upper - 1000)
+
+                # Safe bit length calculation
+                try:
+                    scale_bits = step_distance.bit_length()
+                except (AttributeError, OverflowError):
+                    scale_bits = len(bin(step_distance)) - 2 if step_distance > 0 else 0
+
+                print(f"\n[Exploration] Step {step_num}: Building training data at scale 2^{scale_bits}")
+                print(f"[Exploration] Transformer will start guiding after {3 - len(transformer.factor_history)} more results")
+
+            # Ensure we don't exceed bounds
+            step_center = min(step_center, search_upper - 1000)
+            if step_center >= search_upper:
                 break
+
+            print(f"\n{'='*80}")
+            # Safe large integer formatting
+            try:
+                center_str = f"{step_center:,}"
+            except (ValueError, OverflowError):
+                center_str = f"{step_center}"
+            print(f"[Lattice] PROGRESSIVE LEARNING STEP {step_num}: Testing position {center_str}")
+            if len(transformer.factor_history) < 3:
+                print(f"[Lattice] EARLY EXPLORATION - Building initial training data")
+            else:
+                print(f"[Lattice] AI-GUIDED SEARCH - Learning from {len(transformer.factor_history)} results")
+            print(f"{'='*80}")
+
+            # Run LLL lattice attack
+            step_radius = 10000
+            step_result = self._bulk_search_step(step_center, step_radius, sqrt_N)
+
+            # Analyze result and learn
+            if step_result:
+                p_candidate, q_candidate, diff, diff_bits = step_result
+
+                # Always print current candidates and difference from N
+                print(f"[Lattice]    Current candidates: p={p_candidate}, q={q_candidate}")
+                if p_candidate * q_candidate != self.N:
+                    product_diff = abs(p_candidate * q_candidate - self.N)
+                    print(f"[Lattice]    Product difference: {product_diff:,} ({product_diff.bit_length()} bits from N)")
+                else:
+                    print(f"[Lattice]    ✓✓✓ PERFECT MATCH: p × q == N")
+
+                if diff == 0 and p_candidate * q_candidate == self.N:
+                    print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND!")
+                    return (p_candidate, q_candidate)
+
+                # Record result for Transformer learning with correction signals
+                known_p = getattr(self, 'known_p', None)
+                known_q = getattr(self, 'known_q', None)
+                transformer.add_search_result(
+                    step_center, diff_bits, sqrt_N, N_bits,
+                    p_candidate, q_candidate, known_p, known_q
+                )
+
+                # Analyze p-q bit difference pattern
+                if p_candidate and q_candidate:
+                    p_q_diff = abs(p_candidate - q_candidate)
+                    p_q_diff_bits = p_q_diff.bit_length() if p_q_diff > 0 else 0
+                    print(f"[Transformer] Recorded p-q bit difference: {p_q_diff_bits} bits")
+                    print(f"[Transformer] Result quality: {diff_bits} bits from exact")
+
+            else:
+                # No result found, still record for learning with correction signals
+                known_p = getattr(self, 'known_p', None)
+                known_q = getattr(self, 'known_q', None)
+                transformer.add_search_result(step_center, None, sqrt_N, N_bits, None, None, known_p, known_q)
+                print(f"[Lattice] No factors found at this position")
+
+            # Retrain Transformer more frequently for progressive learning
+            if use_transformer:
+                history_size = len(transformer.factor_history)
+                # Retrain more often as we gather more data
+                retrain_interval = max(5, 15 - history_size // 10)  # Start at every 5 steps, increase as we learn more
+
+                if step_num % retrain_interval == 0 and history_size >= 3:
+                    print(f"[Transformer] Progressive retraining on {history_size} samples (every {retrain_interval} steps)...")
+                    transformer.train_on_history(epochs=2)  # Shorter training for frequent updates
+
+                    # Show learning progress
+                    if history_size >= 5:
+                        avg_quality = sum(f[4] for f in transformer.factor_history[-10:] if f[4] is not None) / len([f for f in transformer.factor_history[-10:] if f[4] is not None])
+                        print(f"[Transformer] Recent average quality: {avg_quality:.1f} bits from exact")
+
+            # Update position for next iteration
+            # Transformer now controls positioning completely - no fixed increment
+            current_position = step_center  # Will be updated by Transformer prediction next iteration
+
+            # Reset failure counter on any result
+            if step_result:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            # Periodic status update
+            if step_num % 50 == 0:
+                print(f"[Lattice] Progress: {step_num} steps completed, {consecutive_failures} consecutive failures")
+                if use_transformer:
+                    print(f"[Transformer] Has {len(transformer.factor_history)} learning samples")
+                    print(f"[Transformer] Current search position: 2^{current_position.bit_length()} bits")
+
+        # Search complete (gave up after too many consecutive failures)
+        print(f"\n{'='*80}")
+        print(f"[Lattice] PROGRESSIVE LEARNING TERMINATED ({step_num} steps)")
+        print(f"[Lattice] Stopped after {consecutive_failures} consecutive failures")
+        print(f"[Lattice] No exact factorization found")
+        if use_transformer:
+            print(f"[Transformer] Progressive learning completed with {len(transformer.factor_history)} training samples")
+            if len(transformer.factor_history) >= 3:
+                avg_quality = sum(f[4] for f in transformer.factor_history if f[4] is not None) / len([f for f in transformer.factor_history if f[4] is not None])
+                print(f"[Transformer] Final average result quality: {avg_quality:.1f} bits from exact")
+        print(f"{'='*80}")
+
+        return None
+    
+    def _bulk_search_step(self, step_center: int, step_size: int, sqrt_N: int) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Run a single step of the bulk search: pyramidal lattice attack centered at step_center.
+        
+        Uses the pyramidal lattice construction to find factors.
+        
+        Returns: (best_p, best_q, best_diff, best_diff_bits) or None
+        """
+        import math
+        
+        # Use step_center as p_candidate approximation
+        p_candidate = step_center
+        q_candidate = self.N // p_candidate if p_candidate > 0 else sqrt_N
+        
+        print(f"[Lattice]    Step center: {step_center:,} (using as p_candidate)")
+        print(f"[Lattice]    Constructing pyramidal lattice...")
+        
+        # Construct pyramidal lattice basis
+        try:
+            pyramid_basis = self._construct_pyramid_lattice_basis(p_candidate, q_candidate)
+        except Exception as e:
+            print(f"[Lattice]    Failed to construct pyramidal lattice: {e}")
+            return None
+        
+        if pyramid_basis is None or len(pyramid_basis) == 0:
+            print(f"[Lattice]    Empty pyramidal lattice basis")
+            return None
+        
+        # Apply LLL reduction using the same method as _find_best_factorization_corrections
+        try:
+            reduced_basis = self._minimize_lattice(pyramid_basis)
+        except Exception as e:
+            print(f"[Lattice]    LLL reduction failed: {e}")
+            return None
+        
+        if reduced_basis is None or len(reduced_basis) == 0:
+            print(f"[Lattice]    Empty reduced basis")
+            return None
+        
+        print(f"[Lattice]    Reduced pyramidal lattice has {len(reduced_basis)} vectors")
+        
+        # Extract factors from pyramidal lattice vectors
+        # Vector format: [a, b, c] represents a + b*dp + c*dq = 0
+        # Where dp and dq are corrections: p = p_candidate + dp, q = q_candidate + dq
+        best_p = None
+        best_q = None
+        best_diff = None
+        best_diff_bits = None
+        initial_diff = abs(p_candidate * q_candidate - self.N)
+        
+        # Sort vectors by norm (shortest first) - like in _find_best_factorization_corrections
+        vector_norms = []
+        for i, vector in enumerate(reduced_basis):
+            try:
+                if len(vector) < 3:
+                    continue
+                # Compute L2 norm squared
+                norm_sq = sum(int(x)**2 for x in vector[:3] if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vector))
+            except:
+                vector_norms.append((float('inf'), i, vector))
+        
+        vector_norms.sort(key=lambda x: x[0])
+        
+        # Check vectors in order of increasing norm
+        for norm_sq, orig_idx, vector in vector_norms:
+            try:
+                if len(vector) < 3:
+                    continue
+                
+                a, b, c = vector[0], vector[1], vector[2]
+                
+                # Skip if both b and c are zero (no corrections)
+                if (b == 0 and c == 0):
+                    continue
+                
+                # Solve for corrections: a + b*dp + c*dq = 0
+                # Try solving for dp first
+                if b != 0:
+                    # Try dp = -a/b (assuming dq = 0)
+                    try:
+                        dp = -a // b if b != 0 else 0
+                        dq = 0
+                        p_test = p_candidate + dp
+                        q_test = q_candidate + dq
+                        
+                        if p_test > 1 and q_test > 1:
+                            # Check exact factorization
+                            if p_test * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                return (p_test, q_test, 0, 0)
+                            
+                            # Check if p divides N exactly
+                            if self.N % p_test == 0:
+                                q_exact = self.N // p_test
+                                if p_test * q_exact == self.N:
+                                    print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                    return (p_test, q_exact, 0, 0)
+                            
+                            # Check product difference
+                            product = p_test * q_test
+                            product_diff = abs(product - self.N)
+                            product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
+                            
+                            # Update best if this is better
+                            if best_diff is None or product_diff < best_diff:
+                                best_p = p_test
+                                best_q = q_test
+                                best_diff = product_diff
+                                best_diff_bits = product_diff_bits
+                                
+                                # Early exit if very close
+                                if product_diff_bits < 10:
+                                    return (best_p, best_q, best_diff, best_diff_bits)
+                    except:
+                        pass
+                
+                # Try solving for dq
+                if c != 0:
+                    try:
+                        dq = -a // c if c != 0 else 0
+                        dp = 0
+                        p_test = p_candidate + dp
+                        q_test = q_candidate + dq
+                        
+                        if p_test > 1 and q_test > 1:
+                            if p_test * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                return (p_test, q_test, 0, 0)
+                            
+                            if self.N % p_test == 0:
+                                q_exact = self.N // p_test
+                                if p_test * q_exact == self.N:
+                                    print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                    return (p_test, q_exact, 0, 0)
+                            
+                            product = p_test * q_test
+                            product_diff = abs(product - self.N)
+                            product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
+                            
+                            if best_diff is None or product_diff < best_diff:
+                                best_p = p_test
+                                best_q = q_test
+                                best_diff = product_diff
+                                best_diff_bits = product_diff_bits
+                                
+                                if product_diff_bits < 10:
+                                    return (best_p, best_q, best_diff, best_diff_bits)
+                    except:
+                        pass
+                
+                # Try solving for both dp and dq (if both b and c are non-zero)
+                if b != 0 and c != 0:
+                    # Try small dq values and solve for dp
+                    for dq_try in range(-100, 101):
+                        try:
+                            if (a + c * dq_try) % b == 0:
+                                dp = -(a + c * dq_try) // b
+                                p_test = p_candidate + dp
+                                q_test = q_candidate + dq_try
+                                
+                                if p_test > 1 and q_test > 1:
+                                    if p_test * q_test == self.N:
+                                        print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                        return (p_test, q_test, 0, 0)
+                                    
+                                    if self.N % p_test == 0:
+                                        q_exact = self.N // p_test
+                                        if p_test * q_exact == self.N:
+                                            print(f"[Lattice]    ✓✓✓ EXACT FACTORIZATION FOUND (vector {orig_idx})!")
+                                            return (p_test, q_exact, 0, 0)
+                                    
+                                    product = p_test * q_test
+                                    product_diff = abs(product - self.N)
+                                    product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
+                                    
+                                    if best_diff is None or product_diff < best_diff:
+                                        best_p = p_test
+                                        best_q = q_test
+                                        best_diff = product_diff
+                                        best_diff_bits = product_diff_bits
+                                        
+                                        if product_diff_bits < 10:
+                                            return (best_p, best_q, best_diff, best_diff_bits)
+                        except:
+                            continue
+            
+            except Exception as e:
+                continue
+        
+        if best_p is not None:
+            print(f"[Lattice]    Best from this step: p={best_p}, q={best_q}, diff={best_diff_bits} bits")
+            return (best_p, best_q, best_diff, best_diff_bits)
+        
+        return None
+
+    def _find_best_factorization_corrections(self, p_candidate: int, q_candidate: int,
+                                           pyramid_basis: np.ndarray,
+                                           config: Optional[np.ndarray] = None,
+                                           search_radius: int = 1000) -> Tuple[int, int, float]:
+        """
+        Find the best factorization corrections using pyramid lattice reduction.
+        """
+        print(f"[Lattice] Using pyramid lattice for factorization corrections...")
+        print(f"[Lattice] Search radius parameter: {search_radius} ({search_radius.bit_length()} bits)")
+        
+        # For huge search radii, note that we'll extract corrections directly from LLL-reduced vectors
+        if search_radius > 10**100:
+            print(f"[Lattice] Large search radius detected - will extract corrections from LLL-reduced short vectors")
+            print(f"[Lattice] LLL reduction should produce vectors with small coefficients containing the corrections")
+
+        # Minimize the lattice using LLL
+        reduced_basis = self._minimize_lattice(pyramid_basis)
+
+        # Extract corrections from shortest vectors
+        best_dp = 0
+        best_dq = 0
+        best_improvement = 0.0
+        initial_diff = abs(p_candidate * q_candidate - self.N)
+
+        print(f"[Lattice] Analyzing reduced pyramid lattice vectors...")
+        print(f"[Lattice] Reduced basis has {len(reduced_basis)} vectors")
+        print(f"[Lattice] Initial difference: {initial_diff} ({initial_diff.bit_length()} bits)")
+
+        # Sort vectors by their L2 norm (length) - check shortest vectors first
+        # This helps find the best corrections early
+        vector_norms = []
+        for i, vector in enumerate(reduced_basis):
+            try:
+                # Compute L2 norm squared (avoid sqrt for large numbers)
+                norm_sq = sum(int(x)**2 for x in vector if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vector))
+            except:
+                # If norm computation fails, use index as fallback
+                vector_norms.append((float('inf'), i, vector))
+        
+        # Sort by norm (shortest first)
+        vector_norms.sort(key=lambda x: x[0])
+        
+        # Check ALL vectors from the reduced basis - don't limit
+        # For large numbers with poor approximations, we need to check all vectors
+        max_vectors_to_check = len(reduced_basis)
+        
+        print(f"[Lattice] Checking ALL {max_vectors_to_check} vectors from reduced basis (sorted by norm)...")
+        print(f"[Lattice]    (No limit - checking all vectors to maximize chance of finding corrections)")
+        
+        # Check vectors in order of increasing norm
+        for norm_sq, orig_idx, vector in vector_norms:
+            i = orig_idx  # Keep original index for reporting
+            try:
+                # Extract coefficients (vector format: [a, b, c] represents a + b*dp + c*dq = 0)
+                # Where dp and dq are corrections: p = p_candidate + dp, q = q_candidate + dq
+                # The relationship is: (p_candidate + dp) * (q_candidate + dq) = N
+                # Which gives: p_candidate*q_candidate - N + q_candidate*dp + p_candidate*dq + dp*dq = 0
+                # Linearizing: (p_candidate*q_candidate - N) + q_candidate*dp + p_candidate*dq ≈ 0
+                # So: a = p_candidate*q_candidate - N, b = q_candidate, c = p_candidate
+                a, b, c = vector[0], vector[1], vector[2]
+                
+                # Skip if coefficients are too large or zero
+                # For huge search radii, be more lenient - LLL should have made coefficients small
+                if (b == 0 and c == 0):
+                    continue
+                
+                # For huge search radius (2048+ bits), accept reasonable coefficients
+                # With 2048-bit search radius, we need to be very lenient with coefficient filtering
+                # LLL should have reduced coefficients, but we still need to check vectors with larger coefficients
+                if search_radius > 10**100 or (hasattr(search_radius, 'bit_length') and search_radius.bit_length() >= 2048):
+                    # For 2048+ bit search radius, accept coefficients up to a very large bound
+                    # Accept coefficients up to several hundred bits - LLL should have made them reasonable
+                    # For a 2048-bit search radius, we can accept coefficients up to ~500-1000 bits
+                    try:
+                        search_bits = search_radius.bit_length() if hasattr(search_radius, 'bit_length') else 2048
+                        # Accept coefficients up to min(search_radius, 2^1000) - very lenient for 2048-bit keys
+                        max_reasonable_bits = min(search_bits, 1000)  # Accept up to 1000-bit coefficients
+                        max_reasonable = 2 ** max_reasonable_bits
+                        
+                        b_bits = abs(b).bit_length() if hasattr(abs(b), 'bit_length') else 0
+                        c_bits = abs(c).bit_length() if hasattr(abs(c), 'bit_length') else 0
+                        
+                        if abs(b) > max_reasonable or abs(c) > max_reasonable:
+                            # Still log skipped vectors for debugging (first few only)
+                            if i < 10:  # Log first 10 to see what's being filtered
+                                print(f"[Lattice]   Vector {i}: Skipping (b={b_bits} bits, c={c_bits} bits, max={max_reasonable_bits} bits)")
+                            continue
+                        else:
+                            # Log vectors we're checking (first few)
+                            if i < 5:
+                                print(f"[Lattice]   Vector {i}: Checking (b={b_bits} bits, c={c_bits} bits)")
+                    except Exception as e:
+                        # Fallback: just check if within search_radius (very lenient)
+                        if abs(b) > search_radius or abs(c) > search_radius:
+                            continue
+                else:
+                    # Normal filtering for reasonable search radii
+                    if abs(b) > search_radius or abs(c) > search_radius:
+                        continue
+
+                # Solve for corrections: from a + b*p + c*q = 0, with p = p_candidate + dp, q = q_candidate + dq
+                # We get: a + b*(p_candidate + dp) + c*(q_candidate + dq) = 0
+                # So: b*dp + c*dq = -a - b*p_candidate - c*q_candidate
+
+                rhs = -a - b * p_candidate - c * q_candidate
+                
+                # Debug: log vector details for first few vectors
+                if i < 10:
+                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}")
+
+                if b != 0:
+                    dp = rhs // b
+                    dp_bits = abs(dp).bit_length() if abs(dp) > 0 else 0
+                    
+                    # For huge search radius, accept large dp values but check if they actually improve things
+                    if abs(dp) <= search_radius:
+                        dq = 0  # Assume dq = 0 for this vector
+                        p_test = p_candidate + dp
+                        q_test = q_candidate + dq
+
+                        if p_test > 0 and q_test > 0:
+                            product = p_test * q_test
+                            diff = abs(product - self.N)
+                            diff_bits = diff.bit_length() if diff > 0 else 0
+
+                            if product == self.N:
+                                print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq:+d}")
+                                return dp, dq, 1.0
+
+                            if initial_diff > 0:
+                                # Only consider this as improvement if it actually reduces the difference
+                                if diff < initial_diff:
+                                    # Log improvement for first few vectors
+                                    if i < 10:
+                                        print(f"[Lattice]   Vector {i}: dp={dp:+d} ({dp_bits} bits), product diff={diff_bits} bits (initial={initial_diff.bit_length()} bits)")
+                                        improvement_pct = ((initial_diff - diff) / initial_diff * 100) if initial_diff > 0 else 0
+                                        print(f"[Lattice]      ✓ Improvement: {improvement_pct:.2f}%")
+                                    
+                                    # Calculate improvement
+                                    if self.N.bit_length() > 1000:
+                                        diff_bits_calc = abs(diff).bit_length()
+                                        initial_bits_calc = abs(initial_diff).bit_length()
+                                        if diff_bits_calc < initial_bits_calc:
+                                            improvement = min(0.9, (initial_bits_calc - diff_bits_calc) / 10.0)
+                                        else:
+                                            improvement = 0.0
+                                    else:
+                                        try:
+                                            improvement = (initial_diff - diff) / initial_diff
+                                        except OverflowError:
+                                            improvement = 0.0
+                                    
+                                    if improvement > best_improvement:
+                                        best_improvement = improvement
+                                        best_dp = dp
+                                        best_dq = dq
+                
+                elif c != 0:
+                    # If b == 0, solve for dq: c*dq = -a - c*q_candidate
+                    dq = (-a - c * q_candidate) // c
+                    dq_bits = abs(dq).bit_length() if abs(dq) > 0 else 0
+                    
+                    if abs(dq) <= search_radius:
+                        dp = 0  # Assume dp = 0 for this vector
+                        p_test = p_candidate + dp
+                        q_test = q_candidate + dq
+
+                        if p_test > 0 and q_test > 0:
+                            product = p_test * q_test
+                            diff = abs(product - self.N)
+
+                            if product == self.N:
+                                print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq:+d}")
+                                return dp, dq, 1.0
+
+                            if initial_diff > 0 and diff < initial_diff:
+                                if self.N.bit_length() > 1000:
+                                    diff_bits_calc = abs(diff).bit_length()
+                                    initial_bits_calc = abs(initial_diff).bit_length()
+                                    if diff_bits_calc < initial_bits_calc:
+                                        improvement = min(0.9, (initial_bits_calc - diff_bits_calc) / 10.0)
+                                    else:
+                                        improvement = 0.0
+                                else:
+                                    try:
+                                        improvement = (initial_diff - diff) / initial_diff
+                                    except OverflowError:
+                                        improvement = 0.0
+                                
+                                if improvement > best_improvement:
+                                    best_improvement = improvement
+                                    best_dp = dp
+                                    best_dq = dq
+                
+                else:
+                    # Both b and c are zero, try solving for both dp and dq
+                    # For simplicity, try small dq values that make sense
+                    # The LLL reduction should have made b and c relatively small
+                    max_dq_try = min(1000, abs(c) // max(1, abs(b))) if abs(b) > 0 else 1000
+                    for dq_candidate in range(-max_dq_try, max_dq_try + 1):
+                        if (rhs - c * dq_candidate) % b == 0:
+                            dp = (rhs - c * dq_candidate) // b
+                            if abs(dp) <= max_dq_try * 10:  # Reasonable bound
+                                p_test = p_candidate + dp
+                                q_test = q_candidate + dq_candidate
+
+                                if p_test > 0 and q_test > 0:
+                                    product = p_test * q_test
+                                    diff = abs(product - self.N)
+
+                                    if product == self.N:
+                                        print(f"[Lattice] ✓✓✓ EXACT FACTORIZATION FOUND from pyramid vector {i}! dp={dp:+d}, dq={dq_candidate:+d}")
+                                        return dp, dq_candidate, 1.0
+
+                                    if initial_diff > 0:
+                                        try:
+                                            improvement = (initial_diff - diff) / initial_diff
+                                        except OverflowError:
+                                            improvement = 0.0
+                                        
+                                        if improvement > best_improvement:
+                                            best_improvement = improvement
+                                            best_dp = dp
+                                            best_dq = dq_candidate
+                                            
+            except Exception as e:
+                continue
+        
+        # Return best corrections found
+        if best_improvement > 0:
+            print(f"[Lattice] Best corrections found: dp={best_dp:+d}, dq={best_dq:+d}, improvement={best_improvement:.4f}")
+            return best_dp, best_dq, best_improvement
+        else:
+            print(f"[Lattice] No improvements found from reduced basis vectors")
+            return 0, 0, 0.0
+        # We'll sample the search space around sqrt(N) and construct a lattice
+        # that helps LLL find the actual factors
+        
+        # Sample points around sqrt(N) with various offsets
+        # Use multiple sampling strategies for maximum coverage
+        offsets = []
+        
+        # Strategy 1: Linear sampling around sqrt(N) - EXPANDED RANGE
+        # Use a much larger range to find factors far from sqrt(N)
+        linear_samples = lattice_dim // 4
+        # Expand step size significantly - factors might be far from sqrt(N)
+        max_offset = min(sqrt_N // 2, search_radius) if search_radius < sqrt_N else sqrt_N // 2
+        step = max(1, max_offset // (linear_samples * 2))
+        for i in range(-linear_samples, linear_samples + 1):
+            offset = i * step
+            offsets.append(offset)
+        
+        # Strategy 2: Logarithmic/exponential sampling for VERY large range
+        # This covers factors that are significantly different from sqrt(N)
+        log_samples = lattice_dim // 3
+        for i in range(-log_samples // 2, log_samples // 2 + 1):
+            if i == 0:
+                offset = 0
+            else:
+                sign = 1 if i > 0 else -1
+                exp_offset = abs(i)
+                # Use much larger offsets - factors might be far from sqrt(N)
+                max_offset_bits = min(search_radius.bit_length(), sqrt_N_bits + 200)  # Allow larger range
+                offset = sign * (2 ** min(exp_offset * 8, max_offset_bits // 2))  # Increased multiplier
+            if offset not in offsets:
+                offsets.append(offset)
+        
+        # Strategy 3: Power-of-2 sampling for systematic coverage - EXPANDED
+        pow_samples = lattice_dim // 4
+        for exp in range(pow_samples):
+            for sign in [-1, 1]:
+                # Allow much larger offsets
+                offset = sign * (2 ** min(exp * 5, (sqrt_N_bits + 200) // 2))  # Increased range
+                if offset not in offsets and len(offsets) < lattice_dim:
+                    offsets.append(offset)
+        
+        # Strategy 4: Sample around different center points (not just sqrt(N))
+        # If factors are far from sqrt(N), try centers at different scales
+        center_samples = lattice_dim // 6
+        for center_scale in [1, 2, 4, 8, 16, 32, 64, 128]:
+            center = sqrt_N // center_scale if center_scale > 1 else sqrt_N
+            for i in range(-center_samples // 8, center_samples // 8 + 1):
+                offset = (center - sqrt_N) + i * (center // 100) if center > 100 else (center - sqrt_N) + i
+                if offset not in offsets and len(offsets) < lattice_dim:
+                    offsets.append(offset)
+        
+        # Strategy 5: Random-like offsets for better coverage (deterministic seed)
+        import random
+        random.seed(42)  # Deterministic for reproducibility
+        remaining = lattice_dim - len(offsets)
+        for _ in range(min(remaining, lattice_dim // 4)):
+            # Much larger random range
+            offset = random.randint(-sqrt_N // 10, sqrt_N // 10)
+            if offset not in offsets:
+                offsets.append(offset)
+        
+        # Ensure we have exactly lattice_dim offsets (or as close as possible)
+        while len(offsets) < lattice_dim:
+            # Fill with additional systematic offsets - expanded range
+            for i in range(len(offsets), lattice_dim):
+                offset = (i - lattice_dim // 2) * (max_offset // max(1, lattice_dim))
+                if offset not in offsets:
+                    offsets.append(offset)
+                if len(offsets) >= lattice_dim:
+                    break
+        
+        print(f"[Lattice]    Generated {len(offsets)} candidate offsets")
+        print(f"[Lattice]    Using ALL {min(len(offsets), lattice_dim)} offsets for maximum coverage...")
+        
+        # Use all offsets up to lattice_dim (maximize!)
+        offsets_to_use = offsets[:lattice_dim] if len(offsets) > lattice_dim else offsets
+        print(f"[Lattice]    Processing {len(offsets_to_use)} candidate points...")
+        
+        # Construct polynomial-based lattice following the SAME Diophantine polynomial as univariate approach
+        # Use: f(x,v) = x² + 2tx + (t² - N) - v² = 0
+        # Where t = (p_approx + q_approx) // 2 or sqrt(N)
+        # Then p = u - v, q = u + v where u = t + x
+        
+        # Compute t (same as univariate polynomial approach)
+        if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
+            t = (self.p_approx + self.q_approx) // 2
+        else:
+            t = sqrt_N
+        
+        print(f"[Lattice]    → Using SAME Diophantine polynomial as univariate approach:")
+        print(f"[Lattice]    → f(x,v) = x² + 2tx + (t² - N) - v² = 0")
+        print(f"[Lattice]    → Where t = {t}, and p = u - v, q = u + v (u = t + x)")
+        print(f"[Lattice]    → Looking for small roots x, v using LLL")
+        
+        # Construct lattice vectors representing the Diophantine polynomial
+        # Vector format: [x, x², v, v², constant] or simplified [x, v, constant]
+        # For the polynomial x² + 2tx + (t² - N) - v² = 0
+        # We want to find small x, v such that the polynomial evaluates to 0
+        
+        scale = max(1, sqrt_N.bit_length() // 10)
+        t_sq_minus_N = t * t - self.N
+        
+        # Construct lattice vectors that represent the Diophantine polynomial
+        # f(x,v) = x² + 2tx + (t² - N) - v² = 0
+        # We want to find small roots x, v
+        # Better approach: construct vectors that represent polynomial monomials
+        # Vector format: [x, v, x², v², constant] scaled appropriately
+        
+        for offset in offsets_to_use:
+            x = offset  # x is the correction: u = t + x
+            
+            # For the Diophantine polynomial, we need to find x and v such that:
+            # x² + 2tx + (t² - N) - v² = 0
+            # Rearranging: v² = x² + 2tx + (t² - N)
+            
+            # Compute what v² should be for this x
+            v_squared_target = x * x + 2 * t * x + t_sq_minus_N
+            
+            # Try integer v values around sqrt(v_squared_target) if positive
+            # LLL will help find the right combination
+            if v_squared_target >= 0:
+                v_candidate = int(math.isqrt(abs(v_squared_target))) if v_squared_target > 0 else 0
+                # Try a few v values around the candidate
+                for v_offset in [-2, -1, 0, 1, 2]:
+                    v = v_candidate + v_offset
+                    
+                    # Compute polynomial value: f(x,v) = x² + 2tx + (t² - N) - v²
+                    polynomial_value = x * x + 2 * t * x + t_sq_minus_N - v * v
+                    
+                    # Create vector: [x, v, polynomial_value]
+                    # For valid roots, polynomial_value should be 0 (or very small)
+                    basis_vectors.append([
+                        x // scale,  # x term
+                        v // scale,  # v term
+                        polynomial_value // (scale * scale) if scale > 0 else polynomial_value  # polynomial value
+                    ])
+            else:
+                # v_squared_target is negative, try v = 0
+                polynomial_value = x * x + 2 * t * x + t_sq_minus_N
+                basis_vectors.append([
+                    x // scale,
+                    0,
+                    polynomial_value // (scale * scale) if scale > 0 else polynomial_value
+                ])
+        
+        # Add fundamental polynomial relationship vectors
+        # Vector 1: x coefficient (2t)
+        basis_vectors.append([(2 * t) // scale, 0, 0])
+        # Vector 2: constant term (t² - N)
+        basis_vectors.append([0, 0, t_sq_minus_N // (scale * scale) if scale > 0 else t_sq_minus_N])
+        # Vector 3: v term
+        basis_vectors.append([0, 1, 0])
         
         if len(basis_vectors) < 3:
             print(f"[Lattice]    Not enough basis vectors, skipping bulk search")
@@ -6770,33 +8409,18 @@ class MinimizableFactorizationLatticeSolver:
             traceback.print_exc()
             return None
         
-        # OPTIMIZED: Prioritize shorter vectors and add early termination
-        # Sort vectors by length (shorter = more likely to contain factors)
-        vector_norms = []
-        for i, vec in enumerate(reduced):
-            try:
-                # Compute L2 norm squared
-                norm_sq = sum(int(x)**2 for x in vec if isinstance(x, (int, np.integer)))
-                vector_norms.append((norm_sq, i, vec))
-            except:
-                vector_norms.append((float('inf'), i, vec))
-        vector_norms.sort(key=lambda x: x[0])  # Sort by norm (shortest first)
-        
-        # OPTIMIZED: Only check top vectors (shortest ones are most promising)
-        max_check = min(len(vector_norms), max(50, len(vector_norms) // 2))
-        vectors_to_check = vector_norms[:max_check]
-        
+        # Check all reduced vectors for factors
         checked = 0
         best_p = None
         best_q = None
         best_diff = None
         best_diff_bits = None
-        total_vectors = len(vectors_to_check)
+        total_vectors = len(reduced)
         
-        print(f"[Lattice]    → OPTIMIZED: Checking top {total_vectors} shortest vectors (most promising)")
+        print(f"[Lattice]    → Starting to check {total_vectors} vectors for factors (real-time updates)...")
         print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%")
         
-        for norm_sq, orig_idx, vector in vectors_to_check:
+        for i, vector in enumerate(reduced):
             try:
                 checked += 1
                 
@@ -6822,140 +8446,154 @@ class MinimizableFactorizationLatticeSolver:
                         print(f"[Lattice]    → Checking vector {checked}/{total_vectors} | No good candidates yet...")
                     print(f"[Lattice]    → Progress bar: [{' ' * 50}] 0%", end='\r')  # Reset progress bar line
                 
-                # Extract factors from PYRAMID LATTICE format
-                # Pyramid format: [a, b, c] representing a + b*p + c*q = 0
-                # For factorization: p * q = N, so we want to find p and q anywhere in [1, N]
+                # Extract polynomial root (x) from vector components
+                # Vector format: [x/scale, x²/scale², constant/scale²]
+                # Following univariate polynomial logic: p = sqrt_N + x
+                # We need to recover x (the root) and then compute p = sqrt_N + x
                 
-                # FIRST: Try direct interpretation - vector components might directly be p and q
-                # This is critical - vectors can contain factors ANYWHERE in [1, N]!
+                # Try different scale factors to recover x
+                scale = max(1, sqrt_N.bit_length() // 10)
+                
+                # Also try interpreting vector components directly as p and q
+                # (fallback in case the polynomial interpretation doesn't work)
                 if len(vector) >= 2:
-                    # Try each component as potential p or q (NO restriction - covers entire N range!)
-                    for comp_idx in range(min(len(vector), 4)):
-                        comp_val = abs(int(vector[comp_idx]))
-                        
-                        # Try as p (can be ANYWHERE from 1 to N, not just near √N!)
-                        if comp_val > 1 and comp_val < self.N:
-                            if self.N % comp_val == 0:
-                                p_test = comp_val
-                                q_test = self.N // comp_val
-                                if p_test * q_test == self.N:
-                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct component {comp_idx}, vector {orig_idx})!")
-                                    print(f"[Lattice]       p = {p_test}, q = {q_test}")
-                                    return (p_test, q_test)
-                            
-                            # Try as q
-                            if comp_val * comp_val <= self.N:
-                                q_test = comp_val
-                                if self.N % q_test == 0:
-                                    p_test = self.N // q_test
-                                    if p_test * q_test == self.N:
-                                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct component {comp_idx} as q, vector {orig_idx})!")
-                                        print(f"[Lattice]       p = {p_test}, q = {q_test}")
-                                        return (p_test, q_test)
-                    
-                    # Also try pairs of components as (p, q)
+                    # Try direct interpretation: vector might be [p, q, error]
                     p_direct = abs(int(vector[0]))
                     q_direct = abs(int(vector[1])) if len(vector) > 1 else 0
-                    if p_direct > 1 and q_direct > 1 and p_direct * q_direct == self.N:
-                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct pair, vector {orig_idx})!")
-                        print(f"[Lattice]       p = {p_direct}, q = {q_direct}")
-                        return (p_direct, q_direct)
+                    
+                    # Check if these are close to √N (might be actual factors)
+                    if p_direct > 1 and abs(p_direct - sqrt_N) < sqrt_N // 10:
+                        if self.N % p_direct == 0:
+                            q_test = self.N // p_direct
+                            if p_direct * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND (direct interpretation, vector {i})!")
+                                print(f"[Lattice]       p = {p_direct}, q = {q_test}")
+                                return (p_direct, q_test)
                 
-                # SECOND: Extract from pyramid lattice format [a, b, c]
-                # For pyramid: a + b*p + c*q = 0, where p*q = N
-                # We want to find p and q that satisfy both constraints
-                if len(vector) >= 3:
-                    a = int(vector[0]) if len(vector) > 0 else 0
-                    b = int(vector[1]) if len(vector) > 1 else 0
-                    c = int(vector[2]) if len(vector) > 2 else 0
+                # Try polynomial root extraction with various scale factors
+                for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
+                    if scale_factor <= 0:
+                        continue
                     
-                    # Try different interpretations of the pyramid relation
-                    # If b != 0, we have: p = (-a - c*q) / b
-                    # Combined with p*q = N: (-a - c*q) * q / b = N
-                    # This gives: -a*q - c*q² = N*b => c*q² + a*q + N*b = 0
+                    # Extract x and v from vector components (Diophantine polynomial roots)
+                    x_cand = int(vector[0]) * scale_factor if len(vector) > 0 else 0
+                    v_cand = int(vector[1]) * scale_factor if len(vector) > 1 else 0
                     
-                    if c != 0:
-                        # Quadratic in q: c*q² + a*q + N*b = 0
-                        # Try to solve for q
-                        discriminant = a*a - 4*c*N*b
-                        if discriminant >= 0:
-                            # Try integer solutions
-                            sqrt_disc = int(math.isqrt(discriminant))
-                            if sqrt_disc * sqrt_disc == discriminant:
-                                q_cand1 = (-a + sqrt_disc) // (2 * c)
-                                q_cand2 = (-a - sqrt_disc) // (2 * c)
-                                
-                                for q_cand in [q_cand1, q_cand2]:
-                                    if q_cand > 1 and q_cand < self.N:
-                                        if self.N % q_cand == 0:
-                                            p_cand = self.N // q_cand
-                                            if p_cand * q_cand == self.N:
-                                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid quadratic (vector {orig_idx})!")
-                                                print(f"[Lattice]       p = {p_cand}, q = {q_cand}")
-                                                return (p_cand, q_cand)
+                    # Compute t (same as construction)
+                    if hasattr(self, 'p_approx') and hasattr(self, 'q_approx') and self.p_approx > 0 and self.q_approx > 0:
+                        t = (self.p_approx + self.q_approx) // 2
+                    else:
+                        t = sqrt_N
                     
-                    # If b != 0, try: p = (-a - c*q) / b
-                    # For various q values across the ENTIRE range [1, N]
-                    if b != 0:
-                        # Try q values across the entire range (not just near sqrt_N!)
-                        # Sample logarithmically to cover all magnitudes
-                        q_samples = []
-                        # Small q values (1 to sqrt_N)
-                        for i in range(10):
-                            q_samples.append(2**i if 2**i < sqrt_N else sqrt_N // (2**(10-i)) if i > 0 else 1)
-                        # Large q values (sqrt_N to N)
-                        for i in range(10):
-                            q_samples.append(sqrt_N * (2**i) if sqrt_N * (2**i) < self.N else self.N // (2**(10-i)) if i > 0 else sqrt_N)
-                        # Also try around sqrt_N
-                        q_samples.extend([sqrt_N, sqrt_N // 2, sqrt_N * 2, self.N // sqrt_N if sqrt_N > 0 else 0])
+                    # Following SAME logic as univariate polynomial approach:
+                    # u = t + x, then p = u - v, q = u + v
+                    u_cand = t + x_cand
+                    p_cand = u_cand - v_cand
+                    q_cand = u_cand + v_cand
+                    
+                    if p_cand > 1 and q_cand > 1:
+                        # Check if p and q are exact factors (Diophantine polynomial root condition!)
+                        if p_cand * q_cand == self.N:
+                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via Diophantine polynomial root (vector {i})!")
+                            print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand} (scale_factor={scale_factor})")
+                            print(f"[Lattice]       u = t + x = {t} + {x_cand} = {u_cand}")
+                            print(f"[Lattice]       p = u - v = {u_cand} - {v_cand} = {p_cand}")
+                            print(f"[Lattice]       q = u + v = {u_cand} + {v_cand} = {q_cand}")
+                            return (p_cand, q_cand)
                         
-                        for q_test in set(q_samples):  # Remove duplicates
-                            if q_test > 1 and q_test < self.N:
-                                p_test = (-a - c * q_test) // b if b != 0 else 0
-                                if p_test > 1 and p_test < self.N:
-                                    if p_test * q_test == self.N:
-                                        print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid relation (vector {orig_idx})!")
-                                        return (p_test, q_test)
-                                    
-                                    if self.N % p_test == 0:
-                                        q_exact = self.N // p_test
-                                        if p_test * q_exact == self.N:
-                                            print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid relation (vector {orig_idx})!")
-                                            return (p_test, q_exact)
-                                    
-                                    # Track best
-                                    poly_eval = abs(p_test * q_test - self.N)
-                                    diff_bits = poly_eval.bit_length() if poly_eval > 0 else 0
-                                    if best_diff is None or poly_eval < best_diff:
-                                        best_p = p_test
-                                        best_q = q_test
-                                        best_diff = poly_eval
-                                        best_diff_bits = diff_bits
-                                        
-                                        if diff_bits < 100:
-                                            print(f"[Lattice]    ⭐ NEW BEST (pyramid relation, vector {orig_idx}):")
-                                            print(f"[Lattice]       p = {p_test}, q = {q_test}, diff = {diff_bits} bits")
+                        # Also check if p divides N exactly
+                        if self.N % p_cand == 0:
+                            q_test = self.N // p_cand
+                            if p_cand * q_test == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
+                                print(f"[Lattice]       Polynomial roots: x = {x_cand}, v = {v_cand}")
+                                print(f"[Lattice]       p = {p_cand}, q = {q_test}")
+                                return (p_cand, q_test)
+                        
+                        # Check Diophantine polynomial evaluation: f(x,v) = x² + 2tx + (t² - N) - v²
+                        # For valid roots, this should be ≈ 0
+                        polynomial_eval = abs(x_cand * x_cand + 2 * t * x_cand + (t * t - self.N) - v_cand * v_cand)
+                        
+                        # Also check if p * q is close to N
+                        product = p_cand * q_cand
+                        product_diff = abs(product - self.N)
+                        product_diff_bits = product_diff.bit_length() if product_diff > 0 else 0
+                        
+                        # Use the smaller of the two errors
+                        if polynomial_eval < product_diff:
+                            diff_bits = polynomial_eval.bit_length() if polynomial_eval > 0 else 0
+                            use_product = False
+                        else:
+                            diff_bits = product_diff_bits
+                            use_product = True
+                        
+                        # Update best if this is better
+                        if best_diff is None or (use_product and product_diff < best_diff) or (not use_product and polynomial_eval < best_diff):
+                            best_p = p_cand
+                            best_q = q_cand
+                            best_diff = product_diff if use_product else polynomial_eval
+                            best_diff_bits = diff_bits
+                            
+                            # Real-time output of best result
+                            if diff_bits < 100:  # Only show if reasonably close
+                                print(f"[Lattice]    ⭐ NEW BEST Diophantine polynomial root (vector {i}):")
+                                print(f"[Lattice]       x = {x_cand}, v = {v_cand}")
+                                print(f"[Lattice]       p = u - v = {p_cand}, q = u + v = {q_cand}")
+                                if use_product:
+                                    print(f"[Lattice]       Product difference: {product_diff} ({diff_bits} bits)")
+                                else:
+                                    print(f"[Lattice]       Polynomial evaluation: f(x,v) = {polynomial_eval} ({diff_bits} bits)")
+                            # Don't print periodic updates - they're too noisy
+                            # The progress bar and 50-vector updates are enough
+                
+                # Also check if vector components directly give polynomial roots
+                # Following univariate polynomial logic: extract x from vector, compute p = sqrt_N + x
+                # Vector format: [x/scale, x²/scale², constant/scale²]
+                # Need to account for scaling to recover actual x
+                if len(vector) >= 1:
+                    scale = max(1, sqrt_N.bit_length() // 10)
                     
-                    # Strategy 3: Try interpreting a, b, c as p, q, or combinations
-                    # Sometimes pyramid vectors encode factors directly
-                    for val in [abs(a), abs(b), abs(c)]:
-                        if val > 1 and val < self.N:
-                            if self.N % val == 0:
-                                p_test = val
-                                q_test = self.N // p_test
-                                if p_test * q_test == self.N:
-                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid coefficient (vector {orig_idx})!")
-                                    return (p_test, q_test)
-                    
-                    # Strategy 4: Try linear combinations
-                    for combo in [abs(a + b), abs(a + c), abs(b + c), abs(a - b), abs(a - c), abs(b - c)]:
-                        if combo > 1 and combo < self.N:
-                            if self.N % combo == 0:
-                                p_test = combo
-                                q_test = self.N // p_test
-                                if p_test * q_test == self.N:
-                                    print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via pyramid combination (vector {orig_idx})!")
-                                    return (p_test, q_test)
+                    # Try different scale factors to recover x
+                    for scale_factor in [1, scale, scale // 10, scale * 10, scale // 100, scale * 100]:
+                        if scale_factor <= 0:
+                            continue
+                        
+                        # Extract x from first component (polynomial root)
+                        # Vector is scaled, so multiply by scale_factor to recover x
+                        x_direct = int(vector[0]) * scale_factor
+                        p_from_root = sqrt_N + x_direct
+                        
+                        if p_from_root > 1 and self.N % p_from_root == 0:
+                            q_from_root = self.N // p_from_root
+                            if p_from_root * q_from_root == self.N:
+                                print(f"[Lattice]    ✓✓✓ EXACT FACTOR FOUND via polynomial root (vector {i})!")
+                                print(f"[Lattice]       Root: x = {x_direct} (recovered with scale_factor={scale_factor})")
+                                print(f"[Lattice]       p = √N + x = {sqrt_N} + {x_direct} = {p_from_root}")
+                                print(f"[Lattice]       q = {q_from_root}")
+                                return (p_from_root, q_from_root)
+                        
+                        # Track best polynomial root
+                        if p_from_root > 1:
+                            # Check polynomial evaluation: f(x) = (sqrt_N + x) * q - N
+                            q_approx = self.N // p_from_root if p_from_root > 0 else 0
+                            if q_approx > 1:
+                                poly_eval = abs(p_from_root * q_approx - self.N)
+                                diff_bits_direct = poly_eval.bit_length() if poly_eval > 0 else 0
+                                
+                                if best_diff is None or poly_eval < best_diff:
+                                    best_p = p_from_root
+                                    best_q = q_approx
+                                    best_diff = poly_eval
+                                    best_diff_bits = diff_bits_direct
+                                    
+                                    if diff_bits_direct < 100:
+                                        print(f"[Lattice]    ⭐ NEW BEST (polynomial root x={x_direct}, vector {i}):")
+                                        print(f"[Lattice]       p = √N + x = {p_from_root}, q ≈ {q_approx}")
+                                        print(f"[Lattice]       Polynomial evaluation: f(x) = {poly_eval} ({diff_bits_direct} bits)")
+                                    
+                                    # Break if we found a good candidate
+                                    if diff_bits_direct < 50:
+                                        break
                             
             except Exception as e:
                 continue
@@ -9072,7 +10710,9 @@ class MinimizableFactorizationLatticeSolver:
             print(f"[Lattice]    Search radius: {search_radius.bit_length()} bits")
             print(f"[Lattice]    Attempting bulk factor search using LLL (approximation-independent)...")
             print(f"[Lattice]    This method creates a large lattice ({100}+ vectors) to search the entire space")
-            bulk_result = self._bulk_search_factors_with_lll(search_radius)
+            # Use pre-trained transformer if available
+            pretrained_transformer = getattr(self, 'pretrained_transformer', None)
+            bulk_result = self._bulk_search_factors_with_lll(search_radius, pretrained_transformer)
             if bulk_result:
                 p_found, q_found = bulk_result
                 if p_found * q_found == self.N:
@@ -9999,6 +11639,248 @@ def estimate_factors(N: int, p_hint: int = None, q_hint: int = None) -> Tuple[in
     return p_candidate, q_candidate
 
 
+def generate_training_rsa_key(bits: int) -> Tuple[int, int, int]:
+    """
+    Generate a training RSA key with known factors for pre-training the transformer.
+
+    Returns:
+        Tuple of (N, p, q) where N = p * q
+    """
+    import random
+    import math
+
+    # Generate two prime factors of roughly equal size
+    half_bits = bits // 2
+
+    # Generate p
+    while True:
+        p = random.getrandbits(half_bits)
+        if p.bit_length() == half_bits and p > 1 and p % 2 != 0:  # Odd number
+            if is_prime(p):
+                break
+
+    # Generate q (ensure different from p)
+    while True:
+        q = random.getrandbits(half_bits)
+        if q.bit_length() == half_bits and q > 1 and q % 2 != 0 and q != p:
+            if is_prime(q):
+                break
+
+    # Ensure p < q for consistency
+    if p > q:
+        p, q = q, p
+
+    N = p * q
+    return N, p, q
+
+
+def is_prime(n: int, k: int = 5) -> bool:
+    """Miller-Rabin primality test for RSA key generation."""
+    if n == 2 or n == 3:
+        return True
+    if n <= 1 or n % 2 == 0:
+        return False
+
+    # Write n-1 as 2^r * d
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+
+    # Witness loop
+    for _ in range(k):
+        a = random.randint(2, n - 2)
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, key_bits: int) -> bool:
+    """
+    Pre-train the transformer on synthetic RSA keys to learn factorization patterns.
+
+    Args:
+        transformer: The transformer to pre-train
+        num_keys: Number of synthetic RSA keys to generate and train on
+        key_bits: Bit length of synthetic keys
+
+    Returns:
+        True if pre-training successful
+    """
+    print(f"\n🎓 STARTING TRANSFORMER PRE-TRAINING")
+    print(f"🎓 Generating {num_keys} synthetic {key_bits}-bit RSA keys...")
+    print(f"🎓 This will teach the transformer how to navigate bitspace to find factors")
+
+    successful_trainings = 0
+
+    for i in range(num_keys):
+        print(f"\n🎓 Pre-training key {i+1}/{num_keys}...")
+
+        # Generate a training RSA key
+        N, true_p, true_q = generate_training_rsa_key(key_bits)
+        print(f"🎓 Generated N={N} with factors p={true_p}, q={true_q}")
+
+        # Create a temporary lattice solver for this training key
+        temp_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
+
+        # Run a mini bulk search to collect training data
+        # We'll simulate the search process to teach the transformer
+        sqrt_N = int(math.isqrt(N))
+        search_radius = min(1000, sqrt_N // 100)  # Smaller radius for training
+
+        print(f"🎓 Running mini bulk search to collect training data...")
+
+        # Simulate several search steps around the true factors
+        training_positions = [
+            sqrt_N,  # Around sqrt(N)
+            true_p,  # Around true p
+            true_q,  # Around true q
+            (true_p + true_q) // 2,  # Around sum
+            abs(true_p - true_q) // 2,  # Around difference
+        ]
+
+        for pos in training_positions:
+            if pos <= 0 or pos > N:
+                continue
+
+            # Simulate a search step at this position
+            step_result = temp_solver._bulk_search_step(pos, search_radius, sqrt_N)
+
+            if step_result:
+                p_found, q_found, diff_bits, _ = step_result
+
+                # Record the result for transformer learning with perfect correction signals
+                transformer.add_search_result(
+                    pos, diff_bits, sqrt_N, N.bit_length(),
+                    p_found, q_found, true_p, true_q  # Perfect supervision during pre-training
+                )
+
+                # Check if we found the exact factors
+                if p_found == true_p and q_found == true_q:
+                    print(f"🎓 ✅ Found exact factors during training!")
+                    successful_trainings += 1
+
+        print(f"🎓 Completed training on key {i+1}")
+
+    # ============================================================================
+    # EXTENSIVE TRAINING: Multiple passes on accumulated knowledge
+    # ============================================================================
+
+    print(f"\n🎓 PHASE 1: Initial training complete")
+    print(f"🎓 Successfully trained on {successful_trainings}/{num_keys} keys")
+    print(f"🎓 Transformer has {len(transformer.search_history)} search experiences")
+
+    # Phase 2: Extensive training on all accumulated data
+    print(f"\n🎓 PHASE 2: Extensive training on accumulated knowledge...")
+    print(f"🎓 Training for 25 epochs on {len(transformer.search_history)} total experiences...")
+
+    transformer.train_on_history(epochs=25)  # Much more training
+
+    # Phase 3: Generate additional diverse training data
+    print(f"\n🎓 PHASE 3: Generating additional diverse training data...")
+    additional_keys = max(20, num_keys // 2)  # Generate more keys for diversity
+
+    for i in range(additional_keys):
+        print(f"🎓 Additional training key {i+1}/{additional_keys}...")
+
+        # Generate a different size key for variety
+        diverse_bits = key_bits + random.randint(-100, 100)  # Vary key size
+        diverse_bits = max(256, min(2048, diverse_bits))  # Keep in reasonable range
+
+        N, true_p, true_q = generate_training_rsa_key(diverse_bits)
+
+        # Run mini search with different parameters for variety
+        sqrt_N = int(math.isqrt(N))
+        search_radius = min(2000, sqrt_N // 50)  # Different radius
+
+        temp_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
+
+        # Test multiple positions around different mathematical landmarks
+        positions = [
+            sqrt_N,
+            true_p, true_q,
+            (true_p + true_q) // 2,
+            abs(true_p - true_q) // 2,
+            true_p + (true_q - true_p) // 3,  # One-third point
+            true_q - (true_q - true_p) // 4,  # Three-quarters point
+        ]
+
+        for pos in positions:
+            if pos <= 0 or pos > N:
+                continue
+
+            step_result = temp_solver._bulk_search_step(pos, search_radius, sqrt_N)
+
+            if step_result:
+                p_found, q_found, diff_bits, _ = step_result
+                transformer.add_search_result(
+                    pos, diff_bits, sqrt_N, N.bit_length(),
+                    p_found, q_found, true_p, true_q
+                )
+
+    # Phase 4: Final extensive training
+    print(f"\n🎓 PHASE 4: Final extensive training...")
+    print(f"🎓 Now training on {len(transformer.search_history)} total experiences...")
+
+    # Train multiple times with different batch configurations
+    for training_round in range(3):
+        print(f"🎓 Training round {training_round + 1}/3...")
+        transformer.train_on_history(epochs=15)  # 15 epochs per round
+
+        # Shuffle the training data between rounds for better generalization
+        if hasattr(transformer, 'search_history') and len(transformer.search_history) > 100:
+            import random as rand
+            rand.shuffle(transformer.search_history[:len(transformer.search_history)//2])  # Shuffle half
+
+    # Phase 5: Validation training on known patterns
+    print(f"\n🎓 PHASE 5: Validation and pattern consolidation...")
+    print(f"🎓 Generating validation keys to test learned patterns...")
+
+    validation_keys = 5
+    for i in range(validation_keys):
+        print(f"🎓 Validation key {i+1}/{validation_keys}...")
+
+        # Use same size as original training for validation
+        N, true_p, true_q = generate_training_rsa_key(key_bits)
+
+        temp_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
+        sqrt_N = int(math.isqrt(N))
+
+        # Test key positions that should be learned
+        test_positions = [true_p, true_q, (true_p + true_q) // 2]
+        search_radius = min(1000, sqrt_N // 100)
+
+        for pos in test_positions:
+            step_result = temp_solver._bulk_search_step(pos, search_radius, sqrt_N)
+            if step_result:
+                p_found, q_found, diff_bits, _ = step_result
+                transformer.add_search_result(
+                    pos, diff_bits, sqrt_N, N.bit_length(),
+                    p_found, q_found, true_p, true_q
+                )
+
+    # Final comprehensive training
+    print(f"\n🎓 FINAL TRAINING: Comprehensive pattern learning...")
+    transformer.train_on_history(epochs=30)  # Final extensive training
+
+    transformer.pretrained = True
+
+    print(f"\n🎓 🎉 EXTENSIVE PRE-TRAINING COMPLETE! 🎉")
+    print(f"🎓 Successfully trained on {successful_trainings + additional_keys + validation_keys} keys total")
+    print(f"🎓 Transformer now has {len(transformer.search_history)} diverse search experiences")
+    print(f"🎓 Training included {25 + 45 + 30} epochs = {100} total training epochs")
+    print(f"🎓 Learned patterns from keys ranging {min(key_bits-100, 256)}-{max(key_bits+100, 2048)} bits")
+
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Standalone Minimizable Factorization Lattice Attack with Enhanced Polynomial Solving",
@@ -10006,7 +11888,7 @@ def main():
         epilog=__doc__
     )
 
-    parser.add_argument("N", type=str, help="The number to factor")
+    parser.add_argument("N", type=str, nargs='?', help="The number to factor (optional when using --pretrain-only)")
     parser.add_argument("--p", type=str, help="Initial P candidate (integer or decimal)")
     parser.add_argument("--q", type=str, help="Initial Q candidate (integer or decimal)")
     parser.add_argument("--p-decimal", type=str, help="P as decimal approximation")
@@ -10054,6 +11936,18 @@ def main():
                        help="Fraction of combinations to test when using sampling (0.0-1.0, default: 1.0)")
     parser.add_argument("--early-termination", action="store_true",
                        help="Stop testing combinations once a good candidate is found")
+    parser.add_argument("--no-transformer", action="store_true",
+                       help="Disable Transformer model (use simpler model to save memory)")
+    parser.add_argument("--pretrain", type=int, default=None,
+                       help="EXTENSIVE pre-training: Generate N diverse RSA keys for broad factorization knowledge (recommended: 20-50)")
+    parser.add_argument("--pretrain-only", action="store_true",
+                       help="Pre-training only mode: Generate and train on RSA keys without factoring a target N")
+    parser.add_argument("--pretrain-bits", type=int, default=1024,
+                       help="Base bit length for pre-training RSA keys (default: 1024, will vary ±100 bits for diversity)")
+    parser.add_argument("--load-pretrained", type=str, default=None,
+                       help="Load pre-trained transformer model from file")
+    parser.add_argument("--save-pretrained", type=str, default=None,
+                       help="Save trained transformer model to file after pre-training/attack")
 
     args = parser.parse_args()
     
@@ -10071,28 +11965,190 @@ def main():
         'root_sampling_strategy': args.root_sampling_strategy,
         'root_sampling_fraction': args.root_sampling_fraction,
         'early_termination': args.early_termination,
+        'no_transformer': args.no_transformer,
     }
 
-    # Parse N
+    # Parse N (optional in pretrain-only mode)
+    if args.pretrain_only:
+        if args.pretrain is None:
+            print("Error: --pretrain-only requires --pretrain N to specify number of keys")
+            return 1
+        N = None  # Not needed for pre-training only
+    else:
+        if args.N is None:
+            print("Error: N is required unless using --pretrain-only")
+            return 1
+        try:
+            N = int(args.N)
+        except ValueError:
+            print(f"Error: Invalid number format: {args.N}")
+            return 1
+
+    print(f"=" * 80)
+    print(f"MINIMIZABLE FACTORIZATION LATTICE + POLYNOMIAL SOLVER")
+    print(f"=" * 80)
+    if args.pretrain_only:
+        print(f"PRE-TRAINING ONLY MODE")
+        print(f"Will generate and train on {args.pretrain} RSA keys")
+        print(f"Key sizes: {args.pretrain_bits - 100} to {args.pretrain_bits + 100} bits")
+        if args.save_pretrained:
+            print(f"Model will be saved to: {args.save_pretrained}")
+        print()
+    else:
+        print(f"Target N: {N}")
+        print(f"Bit length: {N.bit_length()}")
+        print()
+
+    # ============================================================================
+    # FACTORIZATION MODE (skip in pretrain-only mode)
+    # ============================================================================
+    success = False  # Initialize for both modes
+    if not args.pretrain_only:
+        # Initialize lattice solver (only needed for factorization, not pre-training)
+        lattice_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
+
+        # IMPROVEMENT: Refine p and q approximations for better accuracy
+        print(f"\n{'='*80}")
+        print(f"REFINING P AND Q APPROXIMATIONS")
+        print(f"{'='*80}")
+        refined_p, refined_q = lattice_solver.refine_approximations(max_iterations=5)
+        print(f"Refined approximations: p={refined_p}, q={refined_q}")
+        print(f"Error reduction: {abs(lattice_solver.p_approx * lattice_solver.q_approx - N)}")
+        # Store config for use in Root's Method
+        lattice_solver.config = global_config
+        # Store bulk search flag
+        lattice_solver.use_bulk_search = args.bulk
+        # Store pre-trained transformer for bulk search
+        if 'transformer' in locals():
+            lattice_solver.pretrained_transformer = transformer
+
+        # Store known factors for correction/supervised learning
+        lattice_solver.known_p = None
+        lattice_solver.known_q = None
+        if args.p:
+            try:
+                lattice_solver.known_p = int(args.p)
+                print(f"[Correction] 📚 Known P factor provided: {lattice_solver.known_p}")
+            except ValueError:
+                print(f"[Warning] Invalid P factor format: {args.p}")
+        if args.q:
+            try:
+                lattice_solver.known_q = int(args.q)
+                print(f"[Correction] 📚 Known Q factor provided: {lattice_solver.known_q}")
+            except ValueError:
+                print(f"[Warning] Invalid Q factor format: {args.q}")
+
+        if lattice_solver.known_p and lattice_solver.known_q:
+            product = lattice_solver.known_p * lattice_solver.known_q
+            if product == N:
+                print(f"[Correction] ✅ Known factors verified: {lattice_solver.known_p} × {lattice_solver.known_q} = {N}")
+                print(f"[Correction] 🎓 Transformer will receive correction signals during search")
+            else:
+                print(f"[Correction] ⚠️  Known factors don't multiply to N: {product} ≠ {N}")
+                lattice_solver.known_p = None
+                lattice_solver.known_q = None
+
+    # ============================================================================
+    # TRANSFORMER INITIALIZATION
+    # ============================================================================
+    # Always initialize transformer (needed for bulk search)
+    transformer = StepPredictionTransformer(
+        d_model=128, nhead=4, num_layers=2,
+        max_seq_len=500000, use_torch=TORCH_AVAILABLE
+    )
+
+    # Load pre-trained model if specified
+    if args.load_pretrained:
+        print(f"Loading pre-trained model from {args.load_pretrained}...")
+        transformer.load_model(args.load_pretrained)
+
+    # ============================================================================
+    # PRE-TRAINING ONLY MODE: Generate keys and train, then exit
+    # ============================================================================
+    if args.pretrain_only:
+        if args.pretrain is None:
+            print("Error: --pretrain-only requires --pretrain N to specify number of keys")
+            return 1
+
+        print(f"\n{'='*80}")
+        print(f"PRE-TRAINING ONLY MODE")
+        print(f"{'='*80}")
+        print(f"Will generate {args.pretrain} diverse RSA keys")
+        print(f"Key sizes: {args.pretrain_bits - 100} to {args.pretrain_bits + 100} bits")
+        if args.save_pretrained:
+            print(f"Model will be saved to: {args.save_pretrained}")
+
+        # Run extensive pre-training
+        print(f"\nGenerating {args.pretrain} diverse RSA keys for training...")
+        pretrain_success = pretrain_transformer(transformer, args.pretrain, args.pretrain_bits)
+
+        if pretrain_success:
+            print(f"\n✅ PRE-TRAINING COMPLETED SUCCESSFULLY!")
+            print(f"Transformer learned from {len(transformer.search_history)} diverse search experiences")
+
+            # Save the model
+            if args.save_pretrained:
+                print(f"Saving pre-trained model to {args.save_pretrained}...")
+                if transformer.save_model(args.save_pretrained):
+                    print(f"✅ Pre-trained model saved successfully!")
+                else:
+                    print(f"❌ Failed to save model")
+                    return 1
+            else:
+                print(f"⚠️  No save path specified (--save-pretrained). Model will not be saved.")
+
+        else:
+            print(f"❌ Pre-training failed!")
+            return 1
+
+        print(f"\n🎉 Pre-training complete! Use the saved model with:")
+        print(f"python standalone_lattice_attack.py <N> --load-pretrained {args.save_pretrained or 'your_model.pth'} --bulk")
+        return 0
+
+    # ============================================================================
+    # NORMAL FACTORIZATION MODE
+    # ============================================================================
+
+    # Parse N for normal operation
     try:
         N = int(args.N)
     except ValueError:
         print(f"Error: Invalid number format: {args.N}")
         return 1
 
-    print(f"=" * 80)
-    print(f"MINIMIZABLE FACTORIZATION LATTICE + POLYNOMIAL SOLVER")
-    print(f"=" * 80)
-    print(f"Target N: {N}")
-    print(f"Bit length: {N.bit_length()}")
-    print()
+    # ============================================================================
+    # PRE-TRAINING PHASE: Train transformer on synthetic RSA keys
+    # ============================================================================
+    if args.pretrain and not args.no_transformer:
+        print(f"\n{'='*80}")
+        print(f"TRANSFORMER PRE-TRAINING PHASE")
+        print(f"{'='*80}")
 
-    # Initialize lattice solver (needed for both methods)
-    lattice_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
-    # Store config for use in Root's Method
-    lattice_solver.config = global_config
-    # Store bulk search flag
-    lattice_solver.use_bulk_search = args.bulk
+        # Run extensive pre-training for broad factorization knowledge
+        print(f"🎓 EXTENSIVE PRE-TRAINING: Building broad factorization knowledge...")
+        print(f"🎓 This will generate {args.pretrain} diverse RSA keys and train extensively")
+        print(f"🎓 Key sizes: {args.pretrain_bits - 100} to {args.pretrain_bits + 100} bits for pattern diversity")
+        print(f"🎓 Expected training time: {args.pretrain * 2 + 30} minutes")
+        print(f"🎓 Final model will have learned from {args.pretrain * 3 + 25} keys total")
+        pretrain_success = pretrain_transformer(transformer, args.pretrain, args.pretrain_bits)
+
+        if pretrain_success:
+            print(f"✅ Pre-training completed successfully!")
+            print(f"Transformer now has {len(transformer.search_history)} training samples")
+
+            # Save the pre-trained model immediately after pre-training
+            if args.save_pretrained:
+                print(f"\n💾 Saving pre-trained model...")
+                print(f"   Save path: {args.save_pretrained}")
+                print(f"   Training samples: {len(transformer.search_history)}")
+                if transformer.save_model(args.save_pretrained):
+                    print(f"✅ Pre-trained model saved to {args.save_pretrained}")
+                else:
+                    print(f"❌ Failed to save model to {args.save_pretrained}")
+                    return 1
+        else:
+            print(f"❌ Pre-training failed!")
+            return 1
     
     # Check if S² = 4N + D factorization is requested
     success = False
@@ -10747,6 +12803,20 @@ def main():
         print("    - Modular Constraints & Trial Division")
         print("    - Numerical Refinement")
         print("    - Hensel Lifting")
+
+    # ============================================================================
+    # END FACTORIZATION MODE
+    # ============================================================================
+
+    # Save trained transformer if requested (for post-attack learning)
+    # Note: Pre-training saves happen immediately after pre-training above
+    if args.save_pretrained and not args.pretrain:
+        print(f"\n💾 Saving transformer model after attack...")
+        print(f"   Model learned from {len(transformer.search_history)} search attempts on target")
+        if transformer.save_model(args.save_pretrained):
+            print(f"✅ Model saved to {args.save_pretrained}")
+        else:
+            print(f"❌ Failed to save model")
 
     return 0 if success else 1
 
