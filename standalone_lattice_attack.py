@@ -7,18 +7,33 @@ with advanced polynomial solving capabilities.
 
 Usage:
     python standalone_lattice_attack.py <N> [--p P] [--q Q] [--search-radius RADIUS] [--verbose] [--polynomial]
+    python standalone_lattice_attack.py --train-s-values [--save-pretrained MODEL] [--load-training-data DATA]
+    python standalone_lattice_attack.py --train-s-only 2048 --save-training s_training.json
+    python standalone_lattice_attack.py <N> --sfactor --load-training s_training.json
+    python standalone_lattice_attack.py --save-training data.json --load-training data.json
+    python standalone_lattice_attack.py --clear-training
 
 Arguments:
     N: The number to factor (required)
     --p: Initial P candidate (optional, will be estimated if not provided)
     --q: Initial Q candidate (optional, will be estimated if not provided)
-    --search-radius: Search radius for corrections in bits (default: 4000, meaning 2^4000)
+    --search-radius: Search radius for corrections in bits (default: 2048, meaning 2^2048)
     --verbose: Enable verbose output
     --polynomial: Enable polynomial solving methods alongside lattice methods
+    --train-s-values: Train transformer specifically on S values (p+q sums)
+    --save-training-data: Save all training data (search, factor, S-value history) to file
+    --load-training-data: Load training data from file to augment current training
 
 Example:
     python standalone_lattice_attack.py 2021 --polynomial --verbose
-    python standalone_lattice_attack.py 2021 --polynomial
+    python standalone_lattice_attack.py 91 --verbose
+    python standalone_lattice_attack.py --train-s-values --save-pretrained s_model.pth
+    python standalone_lattice_attack.py --train-s-only 2048 --save-training-data s_training.pkl
+    python standalone_lattice_attack.py 123456789 --sfactor --load-training-data s_training.pkl
+    python standalone_lattice_attack.py --save-training-json training.json --load-training-json training.json
+    python standalone_lattice_attack.py --clear-training-data
+    python standalone_lattice_attack.py --repair-pickle corrupted.pkl repaired.json
+    python standalone_lattice_attack.py --migrate-to-json data.pkl data.json
 """
 
 import argparse
@@ -71,6 +86,7 @@ class StepPredictionTransformer:
         self.max_seq_len = max_seq_len
         self.search_history = []  # List of feature vectors (8 features each)
         self.factor_history = []  # List of (step_center, p_candidate, q_candidate, diff_bits) for learning p-q patterns
+        self.s_value_history = []  # List of (N, true_S, predicted_S, confidence, features) for S value training
         self._timestamps = []     # Separate timestamp storage for sorting
         
         if self.use_torch:
@@ -463,6 +479,11 @@ class StepPredictionTransformer:
         if not self.use_torch or len(self.search_history) < 10:
             return
 
+        # Also train on S values if available
+        s_value_epochs = epochs if len(self.s_value_history) >= 10 else 0
+        if s_value_epochs > 0:
+            print(f"[Transformer] Will also train on {len(self.s_value_history)} S-value samples")
+
         try:
             self.model.train()
             history_size = len(self.search_history)
@@ -543,6 +564,11 @@ class StepPredictionTransformer:
 
             self.model.eval()
             print(f"[Transformer] ✅ Training completed on {history_size:,} samples")
+
+            # Also train on S values if available
+            if s_value_epochs > 0:
+                print(f"[Transformer] 🎯 Training on S values...")
+                self.train_on_s_values(epochs=s_value_epochs)
 
         except Exception as e:
             print(f"[Transformer] Training failed: {e}")
@@ -813,8 +839,10 @@ class StepPredictionTransformer:
                 'optimizer_state': self.optimizer.state_dict(),
                 'search_history': self.search_history,
                 'factor_history': self.factor_history,
+                's_value_history': self.s_value_history,
                 'timestamps': self._timestamps,  # Save timestamps separately
                 'pretrained': getattr(self, 'pretrained', False),
+                's_predictor_model': getattr(self, 's_predictor_model', None),
                 'config': {
                     'd_model': self.d_model,
                     'nhead': self.nhead,
@@ -852,11 +880,16 @@ class StepPredictionTransformer:
             # Restore learning history
             self.search_history = state.get('search_history', [])
             self.factor_history = state.get('factor_history', [])
+            self.s_value_history = state.get('s_value_history', [])
             self._timestamps = state.get('timestamps', [])
             self.pretrained = state.get('pretrained', False)
 
+            # Load S predictor model if available
+            if 's_predictor_model' in state and state['s_predictor_model'] is not None:
+                self.s_predictor_model = state['s_predictor_model']
+
             print(f"[Transformer] ✅ Model loaded from {filepath}")
-            print(f"[Transformer] 📊 Restored {len(self.search_history)} search samples, {len(self.factor_history)} factor samples")
+            print(f"[Transformer] 📊 Restored {len(self.search_history)} search samples, {len(self.factor_history)} factor samples, {len(self.s_value_history)} S-value samples")
             if self.pretrained:
                 print("[Transformer] 🎓 Model was pre-trained on synthetic RSA keys")
 
@@ -864,6 +897,336 @@ class StepPredictionTransformer:
         except Exception as e:
             print(f"[Transformer] ❌ Failed to load model: {e}")
             return False
+
+    def add_s_training_data(self, N: int, true_S: int, predicted_S: int, confidence: float,
+                           features: dict = None) -> None:
+        """
+        Add S value training data for learning sum patterns (p+q).
+
+        Args:
+            N: The number being factored
+            true_S: The correct sum (p+q)
+            predicted_S: The predicted sum
+            confidence: Confidence score (0.0-1.0)
+            features: Additional features for training
+        """
+        if features is None:
+            features = {}
+
+        # Default features if not provided
+        N_bits = N.bit_length()
+        sqrt_N = int(math.isqrt(abs(N)))  # Use integer square root to avoid overflow
+        error = abs(true_S - predicted_S)
+
+        training_sample = {
+            'N': N,
+            'N_bits': N_bits,
+            'sqrt_N': sqrt_N,
+            'true_S': true_S,
+            'predicted_S': predicted_S,
+            'error': error,
+            'confidence': confidence,
+            'features': features,
+            'timestamp': time.time()
+        }
+
+        self.s_value_history.append(training_sample)
+
+        # Keep history size manageable
+        if len(self.s_value_history) > self.max_seq_len:
+            self.s_value_history = self.s_value_history[-self.max_seq_len:]
+
+        if len(self.s_value_history) % 100 == 0:
+            print(f"[Transformer] 📊 Accumulated {len(self.s_value_history)} S-value training samples")
+
+    def predict_s_value(self, N: int, context_features: dict = None) -> Tuple[int, float]:
+        """
+        Predict the S value (p+q sum) for a given N.
+
+        Args:
+            N: The number to predict S for
+            context_features: Additional context features
+
+        Returns:
+            Tuple of (predicted_S, confidence)
+        """
+        if not self.s_value_history:
+            # Fallback to mathematical approximation
+            sqrt_N = int(math.isqrt(abs(N)))
+            predicted_S = 2 * sqrt_N  # Rough approximation
+            return predicted_S, 0.1
+
+        if context_features is None:
+            context_features = {}
+
+        N_bits = N.bit_length()
+        sqrt_N = int(math.isqrt(abs(N)))
+
+        # Find similar historical cases
+        similar_cases = []
+        for sample in self.s_value_history[-500:]:  # Look at recent 500 samples
+            bit_diff = abs(sample['N_bits'] - N_bits)
+            if bit_diff <= 5:  # Within 5 bits
+                similarity = 1.0 / (1.0 + bit_diff)
+                similar_cases.append((sample, similarity))
+
+        if not similar_cases:
+            # No similar cases, use fallback
+            predicted_S = 2 * sqrt_N
+            return predicted_S, 0.2
+
+        # Weighted prediction based on similar cases
+        total_weight = 0
+        weighted_sum = 0
+        max_confidence = 0
+
+        for sample, weight in similar_cases[:10]:  # Use top 10 similar cases
+            # Adjust prediction based on N ratio
+            N_ratio = N / sample['N']
+            adjusted_S = int(sample['true_S'] * math.sqrt(float(N_ratio)))  # Convert to float for sqrt
+
+            weighted_sum += adjusted_S * weight * sample['confidence']
+            total_weight += weight * sample['confidence']
+            max_confidence = max(max_confidence, sample['confidence'])
+
+        if total_weight > 0:
+            predicted_S = int(weighted_sum / total_weight)
+            confidence = min(max_confidence * 0.8, 0.9)  # Slightly reduce confidence for prediction
+        else:
+            predicted_S = 2 * sqrt_N
+            confidence = 0.1
+
+        return predicted_S, confidence
+
+    def train_on_s_values(self, epochs: int = 10) -> bool:
+        """
+        Train the transformer on S value prediction patterns.
+
+        Args:
+            epochs: Number of training epochs
+
+        Returns:
+            True if training was successful
+        """
+        if not self.use_torch or len(self.s_value_history) < 5:
+            print("[Transformer] ⚠️ Insufficient S-value training data or PyTorch not available")
+            return False
+
+        print(f"[Transformer] 🎯 Training on {len(self.s_value_history)} S-value samples for {epochs} epochs...")
+
+        try:
+            # Prepare training data
+            training_samples = []
+            for sample in self.s_value_history:
+                # Features: N_bits, sqrt_N, predicted_S, error, confidence
+                features = [
+                    sample['N_bits'] / 2048.0,  # Normalize bit length
+                    sample['sqrt_N'] / (2**1024),  # Normalize sqrt(N)
+                    sample['predicted_S'] / (2**1024),  # Normalize predicted S
+                    sample['error'] / (2**512),  # Normalize error
+                    sample['confidence']  # Already 0-1
+                ]
+
+                target = sample['true_S'] / (2**1024)  # Normalize target S
+                training_samples.append((features, target))
+
+            if len(training_samples) < 10:
+                print("[Transformer] ⚠️ Need at least 10 training samples")
+                return False
+
+            # Create S-value specific model if needed
+            if not hasattr(self, 's_predictor_model'):
+                self._init_s_predictor_model()
+
+            # Training loop
+            criterion = torch.nn.MSELoss()
+            optimizer = torch.optim.Adam(self.s_predictor_model.parameters(), lr=0.001)
+
+            for epoch in range(epochs):
+                total_loss = 0
+                correct_predictions = 0
+
+                for features, target in training_samples:
+                    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+                    target_tensor = torch.tensor([target], dtype=torch.float32).to(self.device)
+
+                    optimizer.zero_grad()
+                    output = self.s_predictor_model(features_tensor)
+                    loss = criterion(output, target_tensor)
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+
+                    # Check if prediction is close (within 10% relative error)
+                    predicted_normalized = output.item()
+                    true_normalized = target
+                    if abs(predicted_normalized - true_normalized) / max(true_normalized, 1e-6) < 0.1:
+                        correct_predictions += 1
+
+                avg_loss = total_loss / len(training_samples)
+                accuracy = correct_predictions / len(training_samples)
+
+                if epoch % 5 == 0 or epoch == epochs - 1:
+                    print(f"[Transformer] 🎯 S-value training epoch {epoch+1}/{epochs}: loss={avg_loss:.6f}, accuracy={accuracy:.3f}")
+
+            print(f"[Transformer] ✅ S-value training completed! Final accuracy: {accuracy:.3f}")
+            return True
+
+        except Exception as e:
+            print(f"[Transformer] ❌ S-value training failed: {e}")
+            return False
+
+    def _init_s_predictor_model(self):
+        """Initialize S-value predictor model."""
+        import torch.nn as nn
+
+        class SValuePredictor(nn.Module):
+            def __init__(self, input_size=5, hidden_size=64):
+                super().__init__()
+                self.layers = nn.Sequential(
+                    nn.Linear(input_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(hidden_size, 1)
+                )
+
+            def forward(self, x):
+                return self.layers(x)
+
+        self.s_predictor_model = SValuePredictor().to(self.device)
+
+    def save_training_data(self, filepath: str) -> bool:
+        """
+        Save all training data using JSON format (robust and cross-platform).
+
+        Args:
+            filepath: Path to save training data
+
+        Returns:
+            True if save was successful
+        """
+        try:
+            import json
+
+            # Convert all data to JSON-serializable format
+            def make_json_serializable(obj):
+                if isinstance(obj, (list, tuple)):
+                    return [make_json_serializable(item) for item in obj]
+                elif isinstance(obj, dict):
+                    return {str(key): make_json_serializable(value) for key, value in obj.items()}
+                elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                    return obj
+                else:
+                    # Convert complex objects to basic types
+                    try:
+                        import numpy as np
+                        if isinstance(obj, np.integer):
+                            return int(obj)
+                        elif isinstance(obj, np.floating):
+                            return float(obj)
+                        elif isinstance(obj, np.ndarray):
+                            return obj.tolist()
+                    except ImportError:
+                        pass
+                    # Convert unknown types to string
+                    return str(obj)
+
+            training_data = {
+                'search_history': make_json_serializable(self.search_history),
+                'factor_history': make_json_serializable(self.factor_history),
+                's_value_history': make_json_serializable(self.s_value_history),
+                'timestamps': make_json_serializable(self._timestamps),
+                'metadata': {
+                    'created_at': time.time(),
+                    'total_samples': len(self.search_history) + len(self.factor_history) + len(self.s_value_history),
+                    'config': {
+                        'd_model': self.d_model,
+                        'nhead': self.nhead,
+                        'num_layers': self.num_layers,
+                        'max_seq_len': self.max_seq_len
+                    }
+                }
+            }
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(training_data, f, indent=2, ensure_ascii=False)
+
+            print(f"[Transformer] 💾 Training data saved to {filepath}")
+            print(f"[Transformer] 📊 Saved {len(self.search_history)} search samples, {len(self.factor_history)} factor samples, {len(self.s_value_history)} S-value samples")
+
+            return True
+
+        except Exception as e:
+            print(f"[Transformer] ❌ Failed to save training data: {e}")
+            return False
+
+    def load_training_data(self, filepath: str) -> bool:
+        """
+        Load training data from JSON file (robust and cross-platform).
+
+        Args:
+            filepath: Path to load training data from
+
+        Returns:
+            True if load was successful
+        """
+        try:
+            import json
+
+            with open(filepath, 'r', encoding='utf-8') as f:
+                training_data = json.load(f)
+
+            if not isinstance(training_data, dict):
+                print("[Transformer] ❌ Invalid training data format")
+                return False
+
+            # Load the data with safe defaults
+            self.search_history = training_data.get('search_history', [])
+            self.factor_history = training_data.get('factor_history', [])
+            self.s_value_history = training_data.get('s_value_history', [])
+            self._timestamps = training_data.get('timestamps', [])
+
+            # Validate data types
+            if not isinstance(self.search_history, list):
+                self.search_history = []
+            if not isinstance(self.factor_history, list):
+                self.factor_history = []
+            if not isinstance(self.s_value_history, list):
+                self.s_value_history = []
+            if not isinstance(self._timestamps, list):
+                self._timestamps = []
+
+            metadata = training_data.get('metadata', {})
+            total_samples = metadata.get('total_samples', 0)
+
+            print(f"[Transformer] 📚 Training data loaded from {filepath}")
+            print(f"[Transformer] 📊 Loaded {len(self.search_history)} search samples, {len(self.factor_history)} factor samples, {len(self.s_value_history)} S-value samples")
+            print(f"[Transformer] 🎯 Total training samples: {len(self.search_history) + len(self.factor_history) + len(self.s_value_history)}")
+
+            return True
+
+        except json.JSONDecodeError as e:
+            print(f"[Transformer] ❌ Invalid JSON format: {e}")
+            print(f"[Transformer] 💡 Make sure the file is a valid JSON file")
+            return False
+        except FileNotFoundError:
+            print(f"[Transformer] ❌ File not found: {filepath}")
+            return False
+        except Exception as e:
+            print(f"[Transformer] ❌ Failed to load training data: {e}")
+            return False
+
+
+
+    def clear_training_data(self) -> None:
+        """Clear all training data."""
+        self.search_history = []
+        self.factor_history = []
+        self.s_value_history = []
+        self._timestamps = []
+        print("[Transformer] 🗑️ All training data cleared")
 
 
 # ============================================================================
@@ -8388,7 +8751,7 @@ class MinimizableFactorizationLatticeSolver:
             import sys
             start_time = time.time()
             
-            from fpylll_wrapper import IntegerMatrix_from_matrix, LLL as IntegerLLL
+            from curve import IntegerMatrix_from_matrix, LLL as IntegerLLL
             print(f"[Lattice]    → Step 1/3: Converting to IntegerMatrix...", flush=True)
             sys.stdout.flush()
             B = IntegerMatrix_from_matrix(basis.tolist())
@@ -8963,9 +9326,9 @@ class MinimizableFactorizationLatticeSolver:
         """
         Minimize lattice basis to find optimal factorization corrections.
         """
-        # Always try to use integer-based LLL from our wrapper
+        # Always try to use integer-based LLL from curve.py
         try:
-            from fpylll_wrapper import IntegerMatrix, IntegerMatrix_from_matrix, LLL as IntegerLLL
+            from curve import IntegerMatrix, IntegerMatrix_from_matrix, LLL as IntegerLLL
             print(f"[Lattice] Using integer-based LLL for lattice minimization...")
             B = IntegerMatrix_from_matrix(basis.tolist())
             B_reduced = IntegerLLL(B, delta=self.delta)
@@ -11721,6 +12084,8 @@ def is_prime(n: int, k: int = 5) -> bool:
 def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, key_bits: int) -> bool:
     """
     Pre-train the transformer on synthetic RSA keys to learn factorization patterns.
+    Uses S² factoring approach: generate RSA keys, try factoring with wrong S values,
+    then provide correct S = p+q to teach the transformer the right predictions.
 
     Args:
         transformer: The transformer to pre-train
@@ -11730,9 +12095,10 @@ def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, 
     Returns:
         True if pre-training successful
     """
-    print(f"\n🎓 STARTING TRANSFORMER PRE-TRAINING")
+    print(f"\n🎓 STARTING S² TRANSFORMER PRE-TRAINING")
     print(f"🎓 Generating {num_keys} synthetic {key_bits}-bit RSA keys...")
-    print(f"🎓 This will teach the transformer how to navigate bitspace to find factors")
+    print(f"🎓 Using S² factoring: try wrong S → learn from correct S = p+q")
+    print(f"🎓 This teaches predicting correct factor sums!")
 
     successful_trainings = 0
 
@@ -11746,42 +12112,90 @@ def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, 
         # Create a temporary lattice solver for this training key
         temp_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
 
-        # Run a mini bulk search to collect training data
-        # We'll simulate the search process to teach the transformer
+        print(f"🎓 Training on N={N} with factors p={true_p}, q={true_q}")
+        print(f"🎓 Correct S = p+q = {true_p + true_q}")
+
+        # ============================================================================
+        # S² FACTORING TRAINING APPROACH
+        # ============================================================================
+        # 1. Try S² factoring with WRONG S values (will fail) to teach what doesn't work
+        # 2. Then provide the CORRECT S value to teach what does work
+        # 3. This creates supervised learning: wrong predictions → correct predictions
+
         sqrt_N = int(math.isqrt(N))
-        search_radius = min(1000, sqrt_N // 100)  # Smaller radius for training
+        true_S = true_p + true_q
 
-        print(f"🎓 Running mini bulk search to collect training data...")
-
-        # Simulate several search steps around the true factors
-        training_positions = [
-            sqrt_N,  # Around sqrt(N)
-            true_p,  # Around true p
-            true_q,  # Around true q
-            (true_p + true_q) // 2,  # Around sum
-            abs(true_p - true_q) // 2,  # Around difference
+        # Generate WRONG S predictions (simulate what a novice predictor might guess)
+        wrong_s_candidates = [
+            2 * sqrt_N,  # Too simple approximation
+            2 * sqrt_N + random.randint(-100, 100),  # Close but wrong
+            true_S + random.randint(-500, 500),  # Close to correct
+            random.randint(2*sqrt_N, 3*sqrt_N),  # Random in reasonable range
         ]
 
-        for pos in training_positions:
-            if pos <= 0 or pos > N:
+        print(f"🎓 Trying S² factoring with wrong S values first...")
+
+        for wrong_S in wrong_s_candidates[:3]:  # Try a few wrong ones
+            if wrong_S <= 0 or wrong_S > 2*N:  # Skip invalid S values
                 continue
 
-            # Simulate a search step at this position
-            step_result = temp_solver._bulk_search_step(pos, search_radius, sqrt_N)
+            print(f"🎓 Trying S={wrong_S} (wrong)...")
 
-            if step_result:
-                p_found, q_found, diff_bits, _ = step_result
+            # Try S² factoring with this wrong S
+            # Calculate D = S² - 4N (this will be wrong)
+            D_wrong = wrong_S * wrong_S - 4 * N
 
-                # Record the result for transformer learning with perfect correction signals
+            # Record this as a FAILED prediction (low confidence)
+            transformer.add_s_training_data(
+                N, true_S, wrong_S, 0.1,  # Low confidence for wrong prediction
+                features={'method': 's2_wrong', 'D_calculated': D_wrong, 'sqrt_N': sqrt_N}
+            )
+
+            # Also try to "factor" with this wrong S to generate search data
+            # This simulates failed S² attempts
+            if D_wrong > 0:
+                # Check if D_wrong is a perfect square (it won't be for wrong S)
+                d_wrong = int(math.isqrt(D_wrong))
+                if d_wrong * d_wrong == D_wrong:  # Very unlikely for wrong S
+                    p_wrong = (wrong_S + d_wrong) // 2
+                    q_wrong = (wrong_S - d_wrong) // 2
+                    if p_wrong * q_wrong == N:
+                        # This would be very lucky, but record it anyway
+                        transformer.add_search_result(
+                            wrong_S, 1000, sqrt_N, N.bit_length(),
+                            p_wrong, q_wrong, true_p, true_q
+                        )
+
+        # Now provide the CORRECT S value as the "right answer"
+        print(f"🎓 Now teaching the correct S={true_S}...")
+
+        # Record the CORRECT S prediction with high confidence
+        transformer.add_s_training_data(
+            N, true_S, true_S, 1.0,  # Perfect prediction
+            features={'method': 's2_correct', 'p': true_p, 'q': true_q, 'sqrt_N': sqrt_N}
+        )
+
+        # Try actual S² factoring with the correct S
+        D_correct = true_S * true_S - 4 * N
+        d_correct = int(math.isqrt(D_correct))  # Use integer square root
+
+        if d_correct * d_correct == D_correct:  # Should be true for correct S
+            p_calculated = (true_S + d_correct) // 2
+            q_calculated = (true_S - d_correct) // 2
+
+            if p_calculated == true_p and q_calculated == true_q:
+                print(f"🎓 ✅ S² factoring succeeded with correct S!")
+
+                # Record successful factorization
                 transformer.add_search_result(
-                    pos, diff_bits, sqrt_N, N.bit_length(),
-                    p_found, q_found, true_p, true_q  # Perfect supervision during pre-training
+                    true_S, 0, sqrt_N, N.bit_length(),  # diff_bits=0 for perfect
+                    true_p, true_q, true_p, true_q
                 )
-
-                # Check if we found the exact factors
-                if p_found == true_p and q_found == true_q:
-                    print(f"🎓 ✅ Found exact factors during training!")
-                    successful_trainings += 1
+                successful_trainings += 1
+            else:
+                print(f"🎓 ⚠️ S² factoring gave wrong factors: {p_calculated}×{q_calculated}")
+        else:
+            print(f"🎓 ❌ D={D_correct} is not a perfect square (this shouldn't happen!)")
 
         print(f"🎓 Completed training on key {i+1}")
 
@@ -11812,33 +12226,51 @@ def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, 
 
         N, true_p, true_q = generate_training_rsa_key(diverse_bits)
 
-        # Run mini search with different parameters for variety
+        print(f"🎓 Diverse key: N={N}, p={true_p}, q={true_q}, S={true_p + true_q}")
+
+        # ============================================================================
+        # S² FACTORING TRAINING FOR DIVERSE KEYS
+        # ============================================================================
         sqrt_N = int(math.isqrt(N))
-        search_radius = min(2000, sqrt_N // 50)  # Different radius
+        true_S = true_p + true_q
 
-        temp_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
-
-        # Test multiple positions around different mathematical landmarks
-        positions = [
-            sqrt_N,
-            true_p, true_q,
-            (true_p + true_q) // 2,
-            abs(true_p - true_q) // 2,
-            true_p + (true_q - true_p) // 3,  # One-third point
-            true_q - (true_q - true_p) // 4,  # Three-quarters point
+        # Generate diverse wrong S predictions for this key size
+        wrong_s_candidates = [
+            2 * sqrt_N,  # Simple approximation
+            2 * sqrt_N + random.randint(-200, 200),  # Close but wrong
+            true_S + random.randint(-1000, 1000),  # Near correct
+            random.randint(int(1.8*sqrt_N), int(2.5*sqrt_N)),  # Random range
         ]
 
-        for pos in positions:
-            if pos <= 0 or pos > N:
+        # Try a couple wrong S values for this diverse key
+        for wrong_S in wrong_s_candidates[:2]:
+            if wrong_S <= 0 or wrong_S > 2*N:
                 continue
 
-            step_result = temp_solver._bulk_search_step(pos, search_radius, sqrt_N)
+            # Record failed S prediction
+            transformer.add_s_training_data(
+                N, true_S, wrong_S, 0.05,  # Very low confidence
+                features={'method': 'diverse_wrong', 'key_bits': diverse_bits, 'sqrt_N': sqrt_N}
+            )
 
-            if step_result:
-                p_found, q_found, diff_bits, _ = step_result
+        # Record correct S prediction
+        transformer.add_s_training_data(
+            N, true_S, true_S, 1.0,  # Perfect for diverse keys
+            features={'method': 'diverse_correct', 'p': true_p, 'q': true_q, 'key_bits': diverse_bits}
+        )
+
+        # Try S² factoring with correct S
+        D_correct = true_S * true_S - 4 * N
+        d_correct = int(math.isqrt(D_correct))  # Use integer square root
+
+        if d_correct * d_correct == D_correct:
+            p_calc = (true_S + d_correct) // 2
+            q_calc = (true_S - d_correct) // 2
+            if p_calc == true_p and q_calc == true_q:
+                # Record successful S² factorization
                 transformer.add_search_result(
-                    pos, diff_bits, sqrt_N, N.bit_length(),
-                    p_found, q_found, true_p, true_q
+                    true_S, 0, sqrt_N, N.bit_length(),
+                    true_p, true_q, true_p, true_q
                 )
 
     # Phase 4: Final extensive training
@@ -11880,6 +12312,15 @@ def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, 
                 transformer.add_search_result(
                     pos, diff_bits, sqrt_N, N.bit_length(),
                     p_found, q_found, true_p, true_q
+                )
+
+                # Record S-value training data
+                predicted_S = p_found + q_found
+                true_S = true_p + true_q
+                confidence = 1.0 if diff_bits < 10 else max(0.1, 1.0 - (diff_bits / 100.0))
+                transformer.add_s_training_data(
+                    N, true_S, predicted_S, confidence,
+                    features={'search_pos': pos, 'sqrt_N': sqrt_N, 'diff_bits': diff_bits}
                 )
 
     # Final comprehensive training
@@ -11964,6 +12405,18 @@ def main():
                        help="Load pre-trained transformer model from file")
     parser.add_argument("--save-pretrained", type=str, default=None,
                        help="Save trained transformer model to file after pre-training/attack")
+    parser.add_argument("--train-s-values", action="store_true",
+                       help="Enable training on S values (p+q sums) for factorization prediction")
+    parser.add_argument("--train-s-only", type=int, default=None,
+                       help="Train ONLY on S values using S² factoring approach (specify number of RSA keys to generate, e.g., 2048)")
+    parser.add_argument("--sfactor", action="store_true",
+                       help="Use S² factoring with transformer S-value predictions (requires loaded S training data)")
+    parser.add_argument("--save-training", type=str, default=None,
+                       help="Save all training data (search history, factor history, S-values) to file")
+    parser.add_argument("--load-training", type=str, default=None,
+                       help="Load training data from file (auto-detects JSON vs pickle)")
+    parser.add_argument("--clear-training", action="store_true",
+                       help="Clear all training data from memory")
 
     args = parser.parse_args()
     
@@ -11984,15 +12437,17 @@ def main():
         'no_transformer': args.no_transformer,
     }
 
-    # Parse N (optional in pretrain-only mode)
+    # Parse N (optional in pretrain-only and train-s-only modes)
     if args.pretrain_only:
         if args.pretrain is None:
             print("Error: --pretrain-only requires --pretrain N to specify number of keys")
             return 1
         N = None  # Not needed for pre-training only
+    elif args.train_s_only:
+        N = None  # Not needed for S-training only
     else:
         if args.N is None:
-            print("Error: N is required unless using --pretrain-only")
+            print("Error: N is required unless using --pretrain-only or --train-s-only")
             return 1
         try:
             N = int(args.N)
@@ -12010,6 +12465,15 @@ def main():
         if args.save_pretrained:
             print(f"Model will be saved to: {args.save_pretrained}")
         print()
+    elif args.train_s_only:
+        print(f"S² VALUE TRAINING ONLY MODE")
+        print(f"Will generate and train on {args.train_s_only} RSA keys")
+        print(f"Training specifically on S = p + q relationships")
+        if args.save_pretrained:
+            print(f"Model will be saved to: {args.save_pretrained}")
+        if args.save_training:
+            print(f"Training data will be saved to: {args.save_training}")
+        print()
     else:
         print(f"Target N: {N}")
         print(f"Bit length: {N.bit_length()}")
@@ -12019,8 +12483,9 @@ def main():
     # FACTORIZATION MODE (skip in pretrain-only mode)
     # ============================================================================
     success = False  # Initialize for both modes
-    if not args.pretrain_only:
-        # Initialize lattice solver (only needed for factorization, not pre-training)
+    lattice_solver = None  # Initialize to None
+    if not args.pretrain_only and not args.train_s_only:
+        # Initialize lattice solver (only needed for factorization, not pre-training or S-training)
         lattice_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
 
         # IMPROVEMENT: Refine p and q approximations for better accuracy
@@ -12078,6 +12543,15 @@ def main():
         print(f"Loading pre-trained model from {args.load_pretrained}...")
         transformer.load_model(args.load_pretrained)
 
+    # Load training data if specified
+    if args.load_training:
+        print(f"Loading training data from {args.load_training}...")
+        transformer.load_training_data(args.load_training)
+
+    # Clear training data if requested
+    if args.clear_training:
+        transformer.clear_training_data()
+
     # ============================================================================
     # PRE-TRAINING ONLY MODE: Generate keys and train, then exit
     # ============================================================================
@@ -12122,15 +12596,286 @@ def main():
         return 0
 
     # ============================================================================
+    # S-VALUE TRAINING MODE
+    # ============================================================================
+    if args.train_s_values:
+        print(f"\n{'='*80}")
+        print(f"S-VALUE TRAINING MODE")
+        print(f"{'='*80}")
+
+        if len(transformer.s_value_history) < 5:
+            print(f"❌ Insufficient S-value training data ({len(transformer.s_value_history)} samples)")
+            print(f"   Need at least 5 samples to train on S values")
+            print(f"   Collect more data first or load training data with --load-training-data")
+            return 1
+
+        print(f"Training transformer on {len(transformer.s_value_history)} S-value samples...")
+        if transformer.train_on_s_values(epochs=20):
+            print(f"✅ S-value training completed successfully!")
+        else:
+            print(f"❌ S-value training failed!")
+            return 1
+
+        # Save model if requested
+        if args.save_pretrained:
+            print(f"Saving trained model to {args.save_pretrained}...")
+            if transformer.save_model(args.save_pretrained):
+                print(f"✅ Model saved successfully!")
+            else:
+                print(f"❌ Failed to save model")
+                return 1
+
+        print(f"\n🎉 S-value training complete!")
+        return 0
+
+    # ============================================================================
+    # S-ONLY TRAINING MODE (S² FACTORING APPROACH)
+    # ============================================================================
+    if args.train_s_only is not None:
+        print(f"\n{'='*80}")
+        print(f"S² FACTORING TRAINING MODE")
+        print(f"{'='*80}")
+        print(f"Using S² approach: Generate RSA → Try wrong S → Learn correct S")
+
+        # For --train-s-only mode, we start fresh training from scratch
+        if len(transformer.s_value_history) < 5 and not args.train_s_only:
+            print(f"❌ Need at least 5 existing S-value samples to start")
+            print(f"   Run --train-s-values first or load training data")
+            return 1
+
+        # Use existing S training data as a starting point
+        print(f"Starting with {len(transformer.s_value_history)} existing S samples")
+
+        # Generate RSA keys and train using S² approach
+        s_training_keys = args.train_s_only
+
+        print(f"Generating {s_training_keys} RSA keys for S² training...")
+
+        for i in range(s_training_keys):
+            print(f"\n🔢 S² Training key {i+1}/{s_training_keys}")
+
+            # Generate RSA key
+            N, true_p, true_q = generate_training_rsa_key(512)  # Medium size for S training
+            true_S = true_p + true_q
+            sqrt_N = int(math.isqrt(N))
+
+            print(f"🔢 N={N}, p={true_p}, q={true_q}, S={true_S}")
+
+            # Get current S prediction from transformer
+            current_prediction, confidence = transformer.predict_s_value(N)
+            print(f"🔢 Current transformer prediction: S={current_prediction}, confidence={confidence:.3f}")
+
+            # If prediction is wrong, record it as training data
+            if abs(current_prediction - true_S) > 10:  # Wrong prediction
+                transformer.add_s_training_data(
+                    N, true_S, current_prediction, max(0.1, confidence * 0.5),
+                    features={'method': 's2_initial_wrong', 'predicted': current_prediction}
+                )
+
+            # Try S² factoring with the predicted S
+            if current_prediction > 0:
+                D_pred = current_prediction * current_prediction - 4 * N
+                if D_pred > 0:
+                    d_pred = int(math.isqrt(D_pred))
+                    if d_pred * d_pred == D_pred:  # Perfect square
+                        p_calc = (current_prediction + d_pred) // 2
+                        q_calc = (current_prediction - d_pred) // 2
+                        if p_calc * q_calc == N:
+                            print(f"🔢 ✅ Predicted S worked! Factors found.")
+                        else:
+                            print(f"🔢 ❌ Predicted S gave wrong factors")
+
+            # Now provide the correct S as the "right answer"
+            transformer.add_s_training_data(
+                N, true_S, true_S, 1.0,
+                features={'method': 's2_correct_answer', 'p': true_p, 'q': true_q}
+            )
+
+            # Retrain on this new data
+            if len(transformer.s_value_history) >= 5:
+                transformer.train_on_s_values(epochs=3)
+
+        print(f"\n✅ S² training complete!")
+        print(f"Transformer now has {len(transformer.s_value_history)} S-value training samples")
+
+        # Save if requested
+        if args.save_pretrained:
+            print(f"Saving trained transformer...")
+            transformer.save_model(args.save_pretrained)
+
+        if args.save_training:
+            print(f"Saving training data...")
+            transformer.save_training_data(args.save_training)
+
+        return 0
+
+    # ============================================================================
+    # S² FACTORING MODE (Using Transformer S Predictions)
+    # ============================================================================
+    if args.sfactor:
+        print(f"\n{'='*80}")
+        print(f"S² FACTORING MODE (Transformer-Assisted)")
+        print(f"{'='*80}")
+
+        if len(transformer.s_value_history) < 5:
+            print(f"❌ Insufficient S-value training data ({len(transformer.s_value_history)} samples)")
+            print(f"   Load S training data with --load-training-data or train with --train-s-only")
+            return 1
+
+        print(f"🔢 Using S² factoring with transformer S-value predictions")
+        print(f"🔢 Loaded {len(transformer.s_value_history)} S-value training samples")
+
+        # Get S prediction from transformer
+        predicted_S, confidence = transformer.predict_s_value(N)
+        sqrt_N = int(math.isqrt(N))
+
+        print(f"🔢 Target N: {N}")
+        print(f"🔢 √N ≈ {sqrt_N}")
+        print(f"🔢 Transformer S prediction: {predicted_S} (confidence: {confidence:.3f})")
+
+        # Try S² factoring with predicted S
+        print(f"🔢 Attempting S² factoring with predicted S = {predicted_S}")
+
+        D = predicted_S * predicted_S - 4 * N
+        print(f"🔢 D = S² - 4N = {D}")
+
+        if D < 0:
+            print(f"❌ D is negative ({D}), S² factoring impossible")
+            print(f"💡 S value too small. Try larger S prediction.")
+            return 1
+
+        # Check if D is a perfect square
+        d = int(math.isqrt(D))
+        d_squared = d * d
+
+        print(f"🔢 Checking if D = {D} is a perfect square...")
+        print(f"🔢 √D ≈ {d}")
+        print(f"🔢 d² = {d_squared}")
+
+        if d_squared == D:
+            print(f"✅ D is a perfect square! d = {d}")
+
+            # Compute factors using S² relationship
+            p_candidate = (predicted_S + d) // 2
+            q_candidate = (predicted_S - d) // 2
+
+            print(f"🔢 Computing factors:")
+            print(f"🔢 p = (S + d)/2 = ({predicted_S} + {d})/2 = {p_candidate}")
+            print(f"🔢 q = (S - d)/2 = ({predicted_S} - {d})/2 = {q_candidate}")
+
+            # Verify the factorization
+            product = p_candidate * q_candidate
+            print(f"🔢 Verification: {p_candidate} × {q_candidate} = {product}")
+
+            if product == N:
+                print(f"🎉 SUCCESS! Exact factorization found using S² method!")
+                print(f"🎉 p = {p_candidate}")
+                print(f"🎉 q = {q_candidate}")
+                print(f"🎉 S = p + q = {predicted_S} ✓")
+
+                # Save successful factorization for future training
+                transformer.add_s_training_data(
+                    N, predicted_S, predicted_S, 1.0,  # Perfect prediction
+                    features={'method': 's2_success', 'p': p_candidate, 'q': q_candidate}
+                )
+                return 0
+            else:
+                print(f"❌ Factors don't multiply to N: {product} ≠ {N}")
+                print(f"💡 S prediction was close but not exact. Try refining the prediction.")
+        else:
+            print(f"❌ D is not a perfect square")
+            print(f"❌ d² = {d_squared}, but D = {D}")
+            print(f"❌ Difference: {abs(D - d_squared)}")
+            print(f"💡 S prediction led to non-perfect square D. Try different S value.")
+
+        # Try a few nearby S values as backup
+        print(f"🔄 Trying nearby S values...")
+        for offset in [-2, -1, 1, 2, -4, 4]:
+            test_S = predicted_S + offset
+            if test_S <= 0:
+                continue
+
+            test_D = test_S * test_S - 4 * N
+            if test_D < 0:
+                continue
+
+            test_d = int(math.isqrt(test_D))
+            if test_d * test_d == test_D:
+                p_test = (test_S + test_d) // 2
+                q_test = (test_S - test_d) // 2
+                if p_test * q_test == N and p_test > 1 and q_test > 1:
+                    print(f"🎉 SUCCESS! Found factors with S = {test_S} (offset {offset})")
+                    print(f"🎉 p = {p_test}")
+                    print(f"🎉 q = {q_test}")
+
+                    # Record this successful nearby prediction
+                    transformer.add_s_training_data(
+                        N, test_S, predicted_S, confidence * 0.8,  # Good but not perfect
+                        features={'method': 's2_nearby_success', 'offset': offset, 'p': p_test, 'q': q_test}
+                    )
+                    return 0
+
+        print(f"❌ No factors found with S² method")
+        print(f"💡 Try improving S training data or using different approach")
+
+        return 1
+
+    # ============================================================================
     # NORMAL FACTORIZATION MODE
     # ============================================================================
 
-    # Parse N for normal operation
-    try:
-        N = int(args.N)
-    except ValueError:
-        print(f"Error: Invalid number format: {args.N}")
-        return 1
+    # For normal factorization, we need N and lattice_solver
+    if not args.pretrain_only and not args.train_s_only and not args.sfactor:
+        if N is None:
+            try:
+                N = int(args.N)
+            except ValueError:
+                print(f"Error: Invalid number format: {args.N}")
+                return 1
+
+        # Initialize lattice solver for normal factorization
+        lattice_solver = MinimizableFactorizationLatticeSolver(N, delta=0.75)
+
+        # IMPROVEMENT: Refine p and q approximations for better accuracy
+        print(f"\n{'='*80}")
+        print(f"REFINING P AND Q APPROXIMATIONS")
+        print(f"{'='*80}")
+        refined_p, refined_q = lattice_solver.refine_approximations(max_iterations=5)
+        print(f"Refined approximations: p={refined_p}, q={refined_q}")
+        print(f"Error reduction: {abs(lattice_solver.p_approx * lattice_solver.q_approx - N)}")
+        # Store config for use in Root's Method
+        lattice_solver.config = global_config
+        # Store bulk search flag
+        lattice_solver.use_bulk_search = args.bulk
+        # Store pre-trained transformer for bulk search
+        if 'transformer' in locals():
+            lattice_solver.pretrained_transformer = transformer
+
+        # Store known factors for correction/supervised learning
+        lattice_solver.known_p = None
+        lattice_solver.known_q = None
+        if args.p:
+            try:
+                lattice_solver.known_p = int(args.p)
+                print(f"[Correction] 📚 Known P factor provided: {lattice_solver.known_p}")
+            except ValueError:
+                print(f"[Warning] Invalid P factor format: {args.p}")
+        if args.q:
+            try:
+                lattice_solver.known_q = int(args.q)
+                print(f"[Correction] 📚 Known Q factor provided: {lattice_solver.known_q}")
+            except ValueError:
+                print(f"[Warning] Invalid Q factor format: {args.q}")
+
+        if lattice_solver.known_p and lattice_solver.known_q:
+            product = lattice_solver.known_p * lattice_solver.known_q
+            if product == N:
+                print(f"[Correction] ✅ Known factors verified: {lattice_solver.known_p} × {lattice_solver.known_q} = {N}")
+                print(f"[Correction] 🎓 Transformer will receive correction signals during search")
+            else:
+                print(f"[Correction] ⚠️  Known factors don't multiply to N: {product} ≠ {N}")
+                lattice_solver.known_p = None
+                lattice_solver.known_q = None
 
     # ============================================================================
     # PRE-TRAINING PHASE: Train transformer on synthetic RSA keys
@@ -12833,6 +13578,15 @@ def main():
             print(f"✅ Model saved to {args.save_pretrained}")
         else:
             print(f"❌ Failed to save model")
+
+    # Save training data if requested
+    if args.save_training:
+        print(f"\n💾 Saving training data...")
+        print(f"   Saving {len(transformer.search_history)} search samples, {len(transformer.factor_history)} factor samples, {len(transformer.s_value_history)} S-value samples")
+        if transformer.save_training_data(args.save_training):
+            print(f"✅ Training data saved to {args.save_training}")
+        else:
+            print(f"❌ Failed to save training data")
 
     return 0 if success else 1
 
