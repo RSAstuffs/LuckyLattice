@@ -1737,7 +1737,7 @@ class EnhancedPolynomialSolver:
                                             # User requested 2^2000, but that's computationally infeasible
                                             # Use a more reasonable but still very large value
                                             search_radius = 2**2000  # User requested 2^2000
-                                            print(f"      Lattice search radius: 2^2000 = {search_radius.bit_length()} bits")
+                                            print(f"      Lattice search radius: 2^2000 = {search_radius}")
                                             
                                             # Solve using lattice - this should find the factors
                                             p_result, q_result, confidence, basis = lattice_solver.solve(
@@ -7489,33 +7489,6 @@ class MinimizableFactorizationLatticeSolver:
             
             # Product relationship variations
             [reduce_coeff(self.N), reduce_coeff(-q_candidate), reduce_coeff(-p_candidate)],  # N - q_candidate*dp - p_candidate*dq = 0
-
-            # Additional base vectors (doubling)
-            [reduce_coeff(error // 2), reduce_coeff(q_candidate // 2), reduce_coeff(p_candidate // 2)],  # Scaled version
-            [reduce_coeff(error * 2 % coeff_limit), reduce_coeff(q_candidate * 2 % coeff_limit), reduce_coeff(p_candidate * 2 % coeff_limit)],  # Double coefficients
-            [reduce_coeff(self.N - p_candidate * q_candidate), reduce_coeff(q_candidate), reduce_coeff(p_candidate)],  # Alternative error form
-            [reduce_coeff(p_candidate + q_candidate), reduce_coeff(-1), reduce_coeff(-1)],  # s - dp - dq = 0
-            [reduce_coeff(p_candidate - q_candidate), reduce_coeff(1), reduce_coeff(-1)],  # d + dp - dq = 0
-            [reduce_coeff(p_candidate * q_candidate % coeff_limit), reduce_coeff(-q_candidate), reduce_coeff(-p_candidate)],  # pq - q*dp - p*dq = 0
-
-            # Additional base vectors (quadrupling)
-            [reduce_coeff(error // 4), reduce_coeff(q_candidate // 4), reduce_coeff(p_candidate // 4)],  # Quarter scaled
-            [reduce_coeff(error * 4 % coeff_limit), reduce_coeff(q_candidate * 4 % coeff_limit), reduce_coeff(p_candidate * 4 % coeff_limit)],  # Quadruple coefficients
-            [reduce_coeff(error * 3 % coeff_limit), reduce_coeff(q_candidate * 3 % coeff_limit), reduce_coeff(p_candidate * 3 % coeff_limit)],  # Triple coefficients
-            [reduce_coeff(p_candidate + q_candidate * 2), reduce_coeff(-2), reduce_coeff(-1)],  # 2q + p - 2dp - dq = 0
-            [reduce_coeff(p_candidate * 2 + q_candidate), reduce_coeff(-1), reduce_coeff(-2)],  # p + 2q - dp - 2dq = 0
-            [reduce_coeff(p_candidate - q_candidate * 2), reduce_coeff(2), reduce_coeff(-1)],  # p - 2q + 2dp - dq = 0
-
-            # Additional base vectors (octupling)
-            [reduce_coeff(error // 8), reduce_coeff(q_candidate // 8), reduce_coeff(p_candidate // 8)],  # Eighth scaled
-            [reduce_coeff(error * 8 % coeff_limit), reduce_coeff(q_candidate * 8 % coeff_limit), reduce_coeff(p_candidate * 8 % coeff_limit)],  # Octuple coefficients
-            [reduce_coeff(error * 5 % coeff_limit), reduce_coeff(q_candidate * 5 % coeff_limit), reduce_coeff(p_candidate * 5 % coeff_limit)],  # Quintuple coefficients
-            [reduce_coeff(error * 6 % coeff_limit), reduce_coeff(q_candidate * 6 % coeff_limit), reduce_coeff(p_candidate * 6 % coeff_limit)],  # Sextuple coefficients
-            [reduce_coeff(error * 7 % coeff_limit), reduce_coeff(q_candidate * 7 % coeff_limit), reduce_coeff(p_candidate * 7 % coeff_limit)],  # Septuple coefficients
-            [reduce_coeff(p_candidate + q_candidate * 3), reduce_coeff(-3), reduce_coeff(-1)],  # 3q + p - 3dp - dq = 0
-            [reduce_coeff(p_candidate * 3 + q_candidate), reduce_coeff(-1), reduce_coeff(-3)],  # p + 3q - dp - 3dq = 0
-            [reduce_coeff(p_candidate - q_candidate * 3), reduce_coeff(3), reduce_coeff(-1)],  # p - 3q + 3dp - dq = 0
-            [reduce_coeff(p_candidate * 3 - q_candidate), reduce_coeff(1), reduce_coeff(3)],  # 3p - q + dp + 3dq = 0
         ]
 
         # Middle layer (derived relations with normalized coefficients)
@@ -7523,7 +7496,7 @@ class MinimizableFactorizationLatticeSolver:
         d = p_candidate - q_candidate  # difference
         pq = p_candidate * q_candidate  # product
 
-        # MASSIVELY EXPANDED: Many more derived relations for large numbers (doubled)
+        # MASSIVELY EXPANDED: Many more derived relations for large numbers
         middle_vectors = [
             [1, 1, -reduce_coeff(s)],  # 1 + p + q = s
             [1, -1, -reduce_coeff(d)], # 1 + p - q = d
@@ -7536,42 +7509,6 @@ class MinimizableFactorizationLatticeSolver:
             # Even more relations for 2048-bit coverage
             [reduce_coeff(p_candidate * q_candidate * s), reduce_coeff(d), -reduce_coeff(p_candidate + q_candidate)],  # pq*s*1 + d*p - (p+q)*q
             [reduce_coeff(p_candidate + q_candidate), reduce_coeff(p_candidate * q_candidate), -reduce_coeff(s * d)],  # (p+q)*1 + pq*p - s*d*q
-
-            # Additional middle vectors (doubling)
-            [reduce_coeff(s // 2), reduce_coeff(d // 2), -reduce_coeff(pq // 2)],  # Scaled versions
-            [reduce_coeff(pq * 2 % coeff_limit), reduce_coeff(s * 2 % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2) * 2 % coeff_limit)],
-            [reduce_coeff(d * 3 % coeff_limit), reduce_coeff(pq * 3 % coeff_limit), -reduce_coeff((p_candidate * s - q_candidate * d) * 3 % coeff_limit)],
-            [reduce_coeff(p_candidate**3 % coeff_limit), reduce_coeff(q_candidate**3 % coeff_limit), -reduce_coeff((p_candidate * q_candidate)**3 % coeff_limit)],
-            [reduce_coeff(p_candidate * q_candidate * s * 2 % coeff_limit), reduce_coeff(d * 2 % coeff_limit), -reduce_coeff((p_candidate + q_candidate) * 2 % coeff_limit)],
-            [reduce_coeff((p_candidate + q_candidate) * 3 % coeff_limit), reduce_coeff(p_candidate * q_candidate * 3 % coeff_limit), -reduce_coeff(s * d * 3 % coeff_limit)],
-            [reduce_coeff(p_candidate**2 - q_candidate**2), reduce_coeff(2 * p_candidate * q_candidate), -reduce_coeff(s)],  # (p²-q²)*1 + 2pq*p - s*q
-            [reduce_coeff(s**2), reduce_coeff(d**2), -reduce_coeff(pq**2)],  # s²*1 + d²*p - pq²*q
-            [reduce_coeff(p_candidate * d), reduce_coeff(q_candidate * s), -reduce_coeff(pq * (p_candidate + q_candidate))],  # Additional cross terms
-
-            # Additional middle vectors (quadrupling)
-            [reduce_coeff(s // 4), reduce_coeff(d // 4), -reduce_coeff(pq // 4)],  # Quarter scaled
-            [reduce_coeff(pq * 4 % coeff_limit), reduce_coeff(s * 4 % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2) * 4 % coeff_limit)],
-            [reduce_coeff(d * 6 % coeff_limit), reduce_coeff(pq * 6 % coeff_limit), -reduce_coeff((p_candidate * s - q_candidate * d) * 6 % coeff_limit)],
-            [reduce_coeff(p_candidate**4 % coeff_limit), reduce_coeff(q_candidate**4 % coeff_limit), -reduce_coeff((p_candidate * q_candidate)**4 % coeff_limit)],
-            [reduce_coeff(p_candidate * q_candidate * s * 4 % coeff_limit), reduce_coeff(d * 4 % coeff_limit), -reduce_coeff((p_candidate + q_candidate) * 4 % coeff_limit)],
-            [reduce_coeff((p_candidate + q_candidate) * 6 % coeff_limit), reduce_coeff(p_candidate * q_candidate * 6 % coeff_limit), -reduce_coeff(s * d * 6 % coeff_limit)],
-            [reduce_coeff(p_candidate**3 - q_candidate**3), reduce_coeff(3 * p_candidate**2 * q_candidate + 3 * p_candidate * q_candidate**2), -reduce_coeff(s * 2)],  # (p³-q³) relations
-            [reduce_coeff(s**3 % coeff_limit), reduce_coeff(d**3 % coeff_limit), -reduce_coeff(pq**3 % coeff_limit)],  # Cubic powers
-            [reduce_coeff(p_candidate * d * 2), reduce_coeff(q_candidate * s * 2), -reduce_coeff(pq * (p_candidate + q_candidate) * 2)],  # Double cross terms
-
-            # Additional middle vectors (octupling)
-            [reduce_coeff(s // 8), reduce_coeff(d // 8), -reduce_coeff(pq // 8)],  # Eighth scaled
-            [reduce_coeff(pq * 8 % coeff_limit), reduce_coeff(s * 8 % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2) * 8 % coeff_limit)],
-            [reduce_coeff(d * 12 % coeff_limit), reduce_coeff(pq * 12 % coeff_limit), -reduce_coeff((p_candidate * s - q_candidate * d) * 12 % coeff_limit)],
-            [reduce_coeff(p_candidate**5 % coeff_limit), reduce_coeff(q_candidate**5 % coeff_limit), -reduce_coeff((p_candidate * q_candidate)**5 % coeff_limit)],
-            [reduce_coeff(p_candidate * q_candidate * s * 8 % coeff_limit), reduce_coeff(d * 8 % coeff_limit), -reduce_coeff((p_candidate + q_candidate) * 8 % coeff_limit)],
-            [reduce_coeff((p_candidate + q_candidate) * 12 % coeff_limit), reduce_coeff(p_candidate * q_candidate * 12 % coeff_limit), -reduce_coeff(s * d * 12 % coeff_limit)],
-            [reduce_coeff(p_candidate**4 - q_candidate**4), reduce_coeff(4 * p_candidate**3 * q_candidate + 4 * p_candidate * q_candidate**3), -reduce_coeff(s * 4)],  # (p⁴-q⁴) relations
-            [reduce_coeff(s**4 % coeff_limit), reduce_coeff(d**4 % coeff_limit), -reduce_coeff(pq**4 % coeff_limit)],  # Fourth powers
-            [reduce_coeff(p_candidate * d * 4), reduce_coeff(q_candidate * s * 4), -reduce_coeff(pq * (p_candidate + q_candidate) * 4)],  # Quadruple cross terms
-            [reduce_coeff(p_candidate**2 * q_candidate - p_candidate * q_candidate**2), reduce_coeff(p_candidate * q_candidate * (p_candidate - q_candidate)), -reduce_coeff(s * d)],  # Difference of squares in pq terms
-            [reduce_coeff((p_candidate + q_candidate)**2 - 2*pq), reduce_coeff(2*s), -reduce_coeff(d**2 + 2*pq)],  # (s - d)(s + d) expanded
-            [reduce_coeff(p_candidate * s - q_candidate * d), reduce_coeff(p_candidate * d + q_candidate * s), -reduce_coeff(pq * (s + d))],  # Complex sum/difference combinations
         ]
 
         # Apex vectors (complex pyramid combinations with bounded coefficients)
@@ -7579,7 +7516,7 @@ class MinimizableFactorizationLatticeSolver:
         q2 = reduce_coeff(q_candidate**2 % coeff_limit)
         pq = reduce_coeff((p_candidate * q_candidate) % coeff_limit)
 
-        # MASSIVELY EXPANDED: Many more apex relations for comprehensive 2048-bit coverage (doubled)
+        # MASSIVELY EXPANDED: Many more apex relations for comprehensive 2048-bit coverage
         apex_vectors = [
             [reduce_coeff(pq), 1, -reduce_coeff(self.N % coeff_limit)],  # pq*1 + 1*p - N*q = pq + p - N*q
             [reduce_coeff(s), reduce_coeff(d), -2],  # s*1 + d*p - 2*q = s + d*p - 2*q
@@ -7593,284 +7530,10 @@ class MinimizableFactorizationLatticeSolver:
             [reduce_coeff((p_candidate + q_candidate)**3), reduce_coeff(3*pq*(p_candidate + q_candidate)), -reduce_coeff(p_candidate**3 + q_candidate**3 + 3*pq*s)],  # Cubic relations
             [reduce_coeff(p_candidate**4 + q_candidate**4 + 2*pq**2), reduce_coeff(4*pq*s), -reduce_coeff((p_candidate**2 + q_candidate**2)**2)],  # Quartic relations
             [reduce_coeff(pq * (p_candidate**2 + q_candidate**2)), reduce_coeff(s**2 - 2*pq), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate))],  # Mixed high-degree relations
-
-            # Additional apex vectors (doubling)
-            [reduce_coeff(pq * 2 % coeff_limit), reduce_coeff(2), -reduce_coeff(self.N * 2 % coeff_limit)],  # Scaled versions
-            [reduce_coeff(s * 3 % coeff_limit), reduce_coeff(d * 3 % coeff_limit), -6],  # Triple coefficients
-            [reduce_coeff((p2 - q2) * 2 % coeff_limit), reduce_coeff(4 * pq % coeff_limit), -2],  # Double difference
-            [reduce_coeff(pq * s * 2 % coeff_limit), reduce_coeff(d * 2 % coeff_limit), -reduce_coeff(p_candidate * 2 % coeff_limit)],  # Double pq*s relation
-            [reduce_coeff((p2 + q2) * 3 % coeff_limit), reduce_coeff(6 * pq % coeff_limit), -reduce_coeff((s**2 - 2*pq) * 3 % coeff_limit)],  # Triple sum
-            [reduce_coeff((p_candidate * d + q_candidate * s) * 2 % coeff_limit), reduce_coeff(pq * 2 % coeff_limit), -reduce_coeff(s * d * 2 % coeff_limit)],  # Double complex
-            [reduce_coeff(pq**3 % coeff_limit), reduce_coeff(s * d * 2 % coeff_limit), -reduce_coeff(p_candidate**3 * q_candidate**3 % coeff_limit)],  # Higher powers
-            [reduce_coeff((p_candidate + q_candidate)**4 % coeff_limit), reduce_coeff(4*pq*(p_candidate + q_candidate) % coeff_limit), -reduce_coeff((p_candidate**4 + q_candidate**4 + 4*pq**3 + 3*pq**2*(p_candidate + q_candidate)) % coeff_limit)],  # Quartic expanded
-            [reduce_coeff(p_candidate**5 % coeff_limit + q_candidate**5 % coeff_limit), reduce_coeff(5*pq**2*s % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2)**3 % coeff_limit)],  # Quintic relations
-            [reduce_coeff(pq * s * d % coeff_limit), reduce_coeff(p_candidate**2 - q_candidate**2), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate))],  # Complex mixed terms
-            [reduce_coeff(s**3 % coeff_limit), reduce_coeff(d**3 % coeff_limit), -reduce_coeff(pq**3 % coeff_limit)],  # Cubic powers of sums/differences
-            [reduce_coeff(p_candidate * s + q_candidate * d), reduce_coeff(pq * (p_candidate - q_candidate)), -reduce_coeff(s * d + pq * (p_candidate + q_candidate))],  # Additional cross terms
-            [reduce_coeff((p_candidate * q_candidate)**2 * s % coeff_limit), reduce_coeff(d * pq % coeff_limit), -reduce_coeff(p_candidate**2 * q_candidate**2 + s * d % coeff_limit)],  # Higher order products
-            [reduce_coeff(p_candidate**3 + q_candidate**3), reduce_coeff(3*pq*s), -reduce_coeff(s**3 - 3*s*pq)],  # Sum/difference of cubes
-            [reduce_coeff(p_candidate**4 - q_candidate**4), reduce_coeff(4*pq*s), -reduce_coeff((p_candidate**2 + q_candidate**2)*(p_candidate**2 - q_candidate**2))],  # Difference of fourth powers
-            [reduce_coeff(pq * (s**2 - d**2) % coeff_limit), reduce_coeff(s * d * 2 % coeff_limit), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * (p_candidate - q_candidate) % coeff_limit)],  # Complex factored terms
-            [reduce_coeff((p_candidate + q_candidate)**2 - 2*pq), reduce_coeff(2*s), -reduce_coeff(d**2 + 2*pq)],  # (s - d)(s + d) relations
-            [reduce_coeff(p_candidate**2 * q_candidate + p_candidate * q_candidate**2), reduce_coeff(s * pq), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate))],  # Symmetric polynomials
-            [reduce_coeff(s * (p_candidate**2 + q_candidate**2) % coeff_limit), reduce_coeff(d * (p_candidate**2 - q_candidate**2) % coeff_limit), -reduce_coeff(pq * (s**2 - d**2) % coeff_limit)],  # Mixed polynomial relations
-
-            # Additional apex vectors (quadrupling)
-            [reduce_coeff(pq * 5 % coeff_limit), reduce_coeff(5), -reduce_coeff(self.N * 5 % coeff_limit)],  # Quintuple versions
-            [reduce_coeff(s * 8 % coeff_limit), reduce_coeff(d * 8 % coeff_limit), -16],  # Higher multiples
-            [reduce_coeff((p2 - q2) * 4 % coeff_limit), reduce_coeff(8 * pq % coeff_limit), -4],  # Higher multiples of difference
-            [reduce_coeff(pq * s * 4 % coeff_limit), reduce_coeff(d * 4 % coeff_limit), -reduce_coeff(p_candidate * 4 % coeff_limit)],  # Quadruple pq*s
-            [reduce_coeff((p2 + q2) * 8 % coeff_limit), reduce_coeff(16 * pq % coeff_limit), -reduce_coeff((s**2 - 2*pq) * 8 % coeff_limit)],  # Higher sum relations
-            [reduce_coeff((p_candidate * d + q_candidate * s) * 4 % coeff_limit), reduce_coeff(pq * 4 % coeff_limit), -reduce_coeff(s * d * 4 % coeff_limit)],  # Quadruple complex
-            [reduce_coeff(pq**4 % coeff_limit), reduce_coeff(s * d * 4 % coeff_limit), -reduce_coeff(p_candidate**4 * q_candidate**4 % coeff_limit)],  # Fourth powers
-            [reduce_coeff((p_candidate + q_candidate)**8 % coeff_limit), reduce_coeff(8*pq*(p_candidate + q_candidate) % coeff_limit), -reduce_coeff((p_candidate**8 + q_candidate**8 + 8*pq**7 + 28*pq**6*(p_candidate + q_candidate) + 35*pq**5*(p_candidate + q_candidate)**2 + 15*pq**4*(p_candidate + q_candidate)**3 + p_candidate**4*q_candidate**4) % coeff_limit)],  # Octic relations
-            [reduce_coeff(p_candidate**6 % coeff_limit + q_candidate**6 % coeff_limit), reduce_coeff(6*pq**2*s % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2)**3 % coeff_limit)],  # Sextic relations
-            [reduce_coeff(pq * s * d * 2 % coeff_limit), reduce_coeff(p_candidate**3 - q_candidate**3), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * 2)],  # Higher mixed
-            [reduce_coeff(s**4 % coeff_limit), reduce_coeff(d**4 % coeff_limit), -reduce_coeff(pq**4 % coeff_limit)],  # Fourth powers of sums/differences
-            [reduce_coeff(p_candidate * s * 3 + q_candidate * d * 3), reduce_coeff(pq * (p_candidate - q_candidate) * 3), -reduce_coeff(s * d * 3 + pq * (p_candidate + q_candidate) * 3)],  # Triple cross terms
-            [reduce_coeff((p_candidate * q_candidate)**3 * s % coeff_limit), reduce_coeff(d * pq * 2 % coeff_limit), -reduce_coeff(p_candidate**3 * q_candidate**3 + s * d * 2 % coeff_limit)],  # Higher products
-            [reduce_coeff(s * (p_candidate**3 + q_candidate**3) % coeff_limit), reduce_coeff(d * (p_candidate**3 - q_candidate**3) % coeff_limit), -reduce_coeff(pq * (s**3 - 3*s*pq) % coeff_limit)],  # Cubic polynomial relations
-            [reduce_coeff((p_candidate + q_candidate)**5 % coeff_limit), reduce_coeff(5*pq*(p_candidate + q_candidate)**2 % coeff_limit), -reduce_coeff(p_candidate**5 + q_candidate**5 + 5*pq*(p_candidate + q_candidate)*(p_candidate**2 + q_candidate**2 - pq) % coeff_limit)],  # Quintic sum relations
-            [reduce_coeff(p_candidate**5 - q_candidate**5), reduce_coeff(5*pq*s), -reduce_coeff((p_candidate**2 + q_candidate**2)*(p_candidate**3 + q_candidate**3) - pq*(p_candidate + q_candidate)*(p_candidate**2 + q_candidate**2))],  # Quintic difference relations
-            [reduce_coeff(pq * (s**2 - d**2) * 2 % coeff_limit), reduce_coeff(s * d * 4 % coeff_limit), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * (p_candidate - q_candidate) * 2 % coeff_limit)],  # Higher factored terms
-            [reduce_coeff((p_candidate + q_candidate)**3 - 3*pq*(p_candidate + q_candidate)), reduce_coeff(3*s**2), -reduce_coeff(d**3 + 3*pq*s)],  # Sum/cube relations
-            [reduce_coeff(p_candidate**4 * q_candidate + p_candidate * q_candidate**4), reduce_coeff(s * pq**2), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * 2)],  # Symmetric quartic
-            [reduce_coeff(s * (p_candidate**3 + q_candidate**3) + d * (p_candidate**3 - q_candidate**3)), reduce_coeff(pq * s * 2), -reduce_coeff(p_candidate * q_candidate * (s**2 - d**2))],  # Mixed cubic terms
-
-            # Additional apex vectors (octupling)
-            [reduce_coeff(pq * 6 % coeff_limit), reduce_coeff(6), -reduce_coeff(self.N * 6 % coeff_limit)],  # Sextuple versions
-            [reduce_coeff(s * 12 % coeff_limit), reduce_coeff(d * 12 % coeff_limit), -24],  # Higher multiples
-            [reduce_coeff((p2 - q2) * 6 % coeff_limit), reduce_coeff(12 * pq % coeff_limit), -6],  # Higher multiples of difference
-            [reduce_coeff(pq * s * 6 % coeff_limit), reduce_coeff(d * 6 % coeff_limit), -reduce_coeff(p_candidate * 6 % coeff_limit)],  # Sextuple pq*s
-            [reduce_coeff((p2 + q2) * 12 % coeff_limit), reduce_coeff(24 * pq % coeff_limit), -reduce_coeff((s**2 - 2*pq) * 12 % coeff_limit)],  # Higher sum relations
-            [reduce_coeff((p_candidate * d + q_candidate * s) * 6 % coeff_limit), reduce_coeff(pq * 6 % coeff_limit), -reduce_coeff(s * d * 6 % coeff_limit)],  # Sextuple complex
-            [reduce_coeff(pq**5 % coeff_limit), reduce_coeff(s * d * 6 % coeff_limit), -reduce_coeff(p_candidate**5 * q_candidate**5 % coeff_limit)],  # Fifth powers
-            [reduce_coeff((p_candidate + q_candidate)**10 % coeff_limit), reduce_coeff(10*pq*(p_candidate + q_candidate) % coeff_limit), -reduce_coeff((p_candidate**10 + q_candidate**10 + 10*pq**9 + 45*pq**8*(p_candidate + q_candidate) + 120*pq**7*(p_candidate + q_candidate)**2 + 210*pq**6*(p_candidate + q_candidate)**3 + 252*pq**5*(p_candidate + q_candidate)**4 + 210*pq**4*(p_candidate + q_candidate)**5 + 120*pq**3*(p_candidate + q_candidate)**6 + 45*pq**2*(p_candidate + q_candidate)**7 + 10*pq*(p_candidate + q_candidate)**8 + p_candidate**2*q_candidate**8) % coeff_limit)],  # Decic relations
-            [reduce_coeff(p_candidate**7 % coeff_limit + q_candidate**7 % coeff_limit), reduce_coeff(7*pq**3*s % coeff_limit), -reduce_coeff((p_candidate**2 + q_candidate**2)**3 * (p_candidate + q_candidate) % coeff_limit)],  # Heptic relations
-            [reduce_coeff(pq * s * d * 3 % coeff_limit), reduce_coeff(p_candidate**4 - q_candidate**4), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * 3)],  # Higher mixed
-            [reduce_coeff(s**5 % coeff_limit), reduce_coeff(d**5 % coeff_limit), -reduce_coeff(pq**5 % coeff_limit)],  # Fifth powers of sums/differences
-            [reduce_coeff(p_candidate * s * 4 + q_candidate * d * 4), reduce_coeff(pq * (p_candidate - q_candidate) * 4), -reduce_coeff(s * d * 4 + pq * (p_candidate + q_candidate) * 4)],  # Quadruple cross terms
-            [reduce_coeff((p_candidate * q_candidate)**4 * s % coeff_limit), reduce_coeff(d * pq * 3 % coeff_limit), -reduce_coeff(p_candidate**4 * q_candidate**4 + s * d * 3 % coeff_limit)],  # Higher products
-            [reduce_coeff(s * (p_candidate**4 + q_candidate**4) % coeff_limit), reduce_coeff(d * (p_candidate**4 - q_candidate**4) % coeff_limit), -reduce_coeff(pq * (s**4 - 6*s**2*pq + pq**2) % coeff_limit)],  # Quartic polynomial relations
-            [reduce_coeff((p_candidate + q_candidate)**7 % coeff_limit), reduce_coeff(7*pq*(p_candidate + q_candidate)**3 % coeff_limit), -reduce_coeff(p_candidate**7 + q_candidate**7 + 7*pq*(p_candidate + q_candidate)*(p_candidate**2 + 3*p_candidate*q_candidate*(p_candidate + q_candidate) + q_candidate**2*(p_candidate + q_candidate)**2) % coeff_limit)],  # Heptic sum relations
-            [reduce_coeff(p_candidate**6 - q_candidate**6), reduce_coeff(6*pq*s*(p_candidate + q_candidate)), -reduce_coeff((p_candidate**2 + q_candidate**2)*(p_candidate**4 + q_candidate**4) - pq*(p_candidate + q_candidate)*(p_candidate**2 + q_candidate**2))],  # Sextic difference relations
-            [reduce_coeff(pq * (s**3 - d**3) * 2 % coeff_limit), reduce_coeff(s * d * 6 % coeff_limit), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * (p_candidate - q_candidate) * 2 % coeff_limit)],  # Higher factored terms
-            [reduce_coeff((p_candidate + q_candidate)**4 - 4*pq*(p_candidate + q_candidate)**2 + 2*pq**2), reduce_coeff(4*s**3), -reduce_coeff(d**4 + 4*pq*s**2)],  # (s² - 2pq)² expanded
-            [reduce_coeff(p_candidate**5 * q_candidate + p_candidate * q_candidate**5), reduce_coeff(s * pq**3), -reduce_coeff(p_candidate * q_candidate * (p_candidate + q_candidate) * 3)],  # Symmetric quintic
-            [reduce_coeff(s * (p_candidate**4 + q_candidate**4) + d * (p_candidate**4 - q_candidate**4)), reduce_coeff(pq * s * 3), -reduce_coeff(p_candidate * q_candidate * (s**3 - 3*s*pq))],  # Mixed quartic terms
         ]
 
-        # MASSIVE EXPANSION: Generate thousands of additional vectors to hit error terms
-        # This expands the search range to cover 2^300 level error spaces
-        print(f"[Lattice] Generating EXACT FACTORIZATION vectors (no approximations used)...")
-        print(f"[Lattice] Progress: Base vectors...")
-
-        # Generate vectors that correspond to exact factorizations of N
-        # This is a fundamental departure from approximation-based methods
-        expanded_base = []
-        base_progress = 0
-        for vector_idx, vector in enumerate(base_vectors):
-            a, b, c = vector
-            # Generate variations but STRICTLY check p*q = N constraint
-            for scale in range(1, 10001):  # 1 to 10,000 scaling factors (optimized)
-                candidate = [
-                    reduce_coeff(a * scale % coeff_limit),
-                    reduce_coeff(b * scale % coeff_limit),
-                    reduce_coeff(c * scale % coeff_limit)
-                ]
-                # EXACT FACTORIZATION CONSTRAINT: Only vectors that represent actual N factorizations
-                if self._check_vector_constraint_exact_factorization(candidate):
-                    expanded_base.append(candidate)
-
-                # Also add negative scalings with intelligent constraint
-                candidate_neg = [
-                    reduce_coeff(a * (-scale) % coeff_limit),
-                    reduce_coeff(b * (-scale) % coeff_limit),
-                    reduce_coeff(c * (-scale) % coeff_limit)
-                ]
-                if self._check_vector_constraint_exact_factorization(candidate_neg):
-                    expanded_base.append(candidate_neg)
-
-                # And fractional scalings with exact factorization constraint
-                if scale > 1:
-                    candidate_frac = [
-                        reduce_coeff(a // scale),
-                        reduce_coeff(b // scale),
-                        reduce_coeff(c // scale)
-                    ]
-                    if self._check_vector_constraint_exact_factorization(candidate_frac):
-                        expanded_base.append(candidate_frac)
-
-                # Add modular variations with exact factorization constraint
-                if scale % 100 == 0:  # Every 100th scale
-                    candidate_mod = [
-                        reduce_coeff((a + scale) % coeff_limit),
-                        reduce_coeff((b + scale) % coeff_limit),
-                        reduce_coeff((c + scale) % coeff_limit)
-                    ]
-                    if self._check_vector_constraint_exact_factorization(candidate_mod):
-                        expanded_base.append(candidate_mod)
-
-                # Add power variations with exact factorization constraint
-                if scale <= 100:  # Optimized limit
-                    try:
-                        candidate_pow = [
-                            reduce_coeff(pow(a, scale, coeff_limit)),
-                            reduce_coeff(pow(b, scale, coeff_limit)),
-                            reduce_coeff(pow(c, scale, coeff_limit))
-                        ]
-                        if self._check_vector_constraint_exact_factorization(candidate_pow):
-                            expanded_base.append(candidate_pow)
-                    except:
-                        pass  # Skip if power computation fails
-
-                # Progress reporting
-                if scale % 1000 == 0:
-                    print(f"[Lattice]   Base vector {vector_idx+1}/{len(base_vectors)}: {len(expanded_base)} valid vectors found so far (scale {scale}/10000)")
-
-        print(f"[Lattice] Progress: Middle vectors...")
-        # Generate intelligently constrained variations of middle vectors
-        expanded_middle = []
-        middle_progress = 0
-        for vector_idx, vector in enumerate(middle_vectors):
-            a, b, c = vector
-            # Generate variations but check STRICT constraint
-            for scale1 in range(1, 51):  # 1 to 50 (optimized)
-                for scale2 in range(1, 101):  # 1 to 100 (optimized)
-                    candidate1 = [
-                        reduce_coeff(a * scale1 % coeff_limit),
-                        reduce_coeff(b * scale2 % coeff_limit),
-                        reduce_coeff(c * (scale1 + scale2) % coeff_limit)
-                    ]
-                    # Exact factorization constraint check
-                    if self._check_vector_constraint_exact_factorization(candidate1):
-                        expanded_middle.append(candidate1)
-
-                    # Cross variations with constraint check
-                    candidate2 = [
-                        reduce_coeff(a * scale2 % coeff_limit),
-                        reduce_coeff(b * scale1 % coeff_limit),
-                        reduce_coeff(c * (scale1 * scale2) % coeff_limit)
-                    ]
-                    # Intelligent constraint check
-                    if self._check_vector_constraint_exact_factorization(candidate2):
-                        expanded_middle.append(candidate2)
-
-                    # Additional algebraic combinations with constraint check
-                    candidate3 = [
-                        reduce_coeff((a + b) * scale1 % coeff_limit),
-                        reduce_coeff((b + c) * scale2 % coeff_limit),
-                        reduce_coeff((a + c) * (scale1 + scale2) % coeff_limit)
-                    ]
-                    # No constraint check - generate all
-                    expanded_middle.append(candidate3)
-
-                    # Modular variations with constraint check
-                    if scale1 % 50 == 0 and scale2 % 50 == 0:
-                        try:
-                            candidate4 = [
-                                reduce_coeff(a * scale1 % (coeff_limit // scale2 + 1)),
-                                reduce_coeff(b * scale2 % (coeff_limit // scale1 + 1)),
-                                reduce_coeff(c * (scale1 * scale2) % coeff_limit)
-                            ]
-                            # No constraint check - generate all
-                            expanded_middle.append(candidate4)
-                        except:
-                            pass  # Skip division by zero
-
-                # Progress reporting for middle vectors
-                if scale1 % 10 == 0 and scale2 == 1:
-                    print(f"[Lattice]   Middle vector {vector_idx+1}/{len(middle_vectors)}: {len(expanded_middle)} valid vectors found so far (scale1 {scale1}/50)")
-
-        print(f"[Lattice] Progress: Apex vectors...")
-        # Generate intelligently constrained variations of apex vectors
-        expanded_apex = []
-        apex_progress = 0
-        for vector_idx, vector in enumerate(apex_vectors):
-            a, b, c = vector
-            # Generate variations but STRICTLY enforce constraint
-            for scale in range(1, 101):  # 1 to 100 (optimized)
-                for power in range(1, 6):  # Powers 1-5 (optimized)
-                    try:
-                        candidate1 = [
-                            reduce_coeff((a * scale) ** power % coeff_limit),
-                            reduce_coeff((b * scale) ** power % coeff_limit),
-                            reduce_coeff((c * scale) ** power % coeff_limit)
-                        ]
-                        # Exact factorization constraint check
-                        if self._check_vector_constraint_exact_factorization(candidate1):
-                            expanded_apex.append(candidate1)
-                    except:
-                        pass  # Skip overflow
-
-                    # Also add modular variations with constraint check
-                    candidate2 = [
-                        reduce_coeff(a * scale % coeff_limit),
-                        reduce_coeff(b * scale % coeff_limit),
-                        reduce_coeff(c * scale % coeff_limit)
-                    ]
-                    # Exact factorization constraint check
-                    if self._check_vector_constraint_exact_factorization(candidate2):
-                        expanded_apex.append(candidate2)
-
-                    # Add cryptographic modular variations with constraint check
-                    try:
-                        candidate3 = [
-                            reduce_coeff((a + scale) ** power % coeff_limit),
-                            reduce_coeff((b + scale) ** power % coeff_limit),
-                            reduce_coeff((c + scale) ** power % coeff_limit)
-                        ]
-                        # No constraint check - generate all
-                        expanded_apex.append(candidate3)
-                    except:
-                        pass  # Skip overflow
-
-                    # Add complex algebraic combinations with constraint check
-                    if scale <= 100:  # Extended computational limit
-                        candidate4 = [
-                            reduce_coeff((a * b + c) * scale % coeff_limit),
-                            reduce_coeff((b * c + a) * scale % coeff_limit),
-                            reduce_coeff((c * a + b) * scale % coeff_limit)
-                        ]
-                        # No constraint check - generate all
-                        expanded_apex.append(candidate4)
-
-                        # Higher-order terms with constraint check
-                        candidate5 = [
-                            reduce_coeff(a ** 2 * scale % coeff_limit),
-                            reduce_coeff(b ** 2 * scale % coeff_limit),
-                            reduce_coeff(c ** 2 * scale % coeff_limit)
-                        ]
-                        # No constraint check - generate all
-                        expanded_apex.append(candidate5)
-
-                        # Even higher order terms with constraint check
-                        if power <= 5:  # Limit for feasibility
-                            try:
-                                candidate6 = [
-                                    reduce_coeff(a ** power * scale % coeff_limit),
-                                    reduce_coeff(b ** power * scale % coeff_limit),
-                                    reduce_coeff(c ** power * scale % coeff_limit)
-                                ]
-                                # No constraint check - generate all
-                                expanded_apex.append(candidate6)
-                            except:
-                                pass
-
-                # Progress reporting for apex vectors
-                if scale % 20 == 0 and power == 1:
-                    print(f"[Lattice]   Apex vector {vector_idx+1}/{len(apex_vectors)}: {len(expanded_apex)} valid vectors found so far (scale {scale}/100)")
-
-        # Combine all expanded layers
-        all_vectors = base_vectors + middle_vectors + apex_vectors + expanded_base + expanded_middle + expanded_apex
-
-        print(f"[Lattice] Massive expansion complete:")
-        print(f"[Lattice]   Original: {len(base_vectors)} + {len(middle_vectors)} + {len(apex_vectors)} = {len(base_vectors) + len(middle_vectors) + len(apex_vectors)} vectors")
-        print(f"[Lattice]   Expanded: {len(expanded_base)} + {len(expanded_middle)} + {len(expanded_apex)} = {len(expanded_base) + len(expanded_middle) + len(expanded_apex)} additional vectors")
-        print(f"[Lattice]   Total: {len(all_vectors)} vectors (2^{len(all_vectors).bit_length()} scale)")
-
         # Combine all layers to form pyramid
-        pyramid_basis = all_vectors
+        pyramid_basis = base_vectors + middle_vectors + apex_vectors
 
         # Convert to numpy array
         basis = np.array(pyramid_basis, dtype=object)
@@ -7882,52 +7545,6 @@ class MinimizableFactorizationLatticeSolver:
         print(f"[Lattice]   Coefficient limit: {coeff_limit}")
 
         return basis
-
-    def _check_vector_constraint_exact_factorization(self, vector):
-        """
-        EXACT FACTORIZATION CONSTRAINT: Only accept vectors that correspond to actual factorizations of N
-        For vector [a, b, c], find if there exist p,q such that:
-        - p * q = N (exact factorization)
-        - a + b*p + c*q = 0 (vector equation)
-
-        This solves the system: b*p + c*q = -a and p*q = N
-        """
-        try:
-            a, b, c = vector
-
-            # Handle trivial cases
-            if b == 0 and c == 0:
-                return a == 0  # Only if a=0, any p,q work, but that's degenerate
-
-            # Try to solve the system: b*p + c*q = -a and p*q = N
-            # From the first equation: c*q = -a - b*p, so q = (-a - b*p) / c
-
-            # Try small factors first (most likely to be found)
-            import math
-
-            # Try factors up to a reasonable limit (1000 should be enough for testing)
-            for p in range(2, min(1000, self.N.bit_length()**2)):
-                if self.N % p == 0:  # p divides N
-                    q = self.N // p
-
-                    # Check if this (p,q) satisfies the vector equation: a + b*p + c*q = 0
-                    if a + b * p + c * q == 0:
-                        print(f"[Constraint] ✓ Found exact factorization: p={p}, q={q} satisfies vector [{a}, {b}, {c}]")
-                        return True
-
-            # Also try the symmetric case (q,p) if different
-            for q in range(2, min(1000, self.N.bit_length()**2)):
-                if self.N % q == 0:  # q divides N
-                    p = self.N // q
-                    if p != q:  # Avoid double-counting squares
-                        if a + b * p + c * q == 0:
-                            print(f"[Constraint] ✓ Found exact factorization: p={p}, q={q} satisfies vector [{a}, {b}, {c}]")
-                            return True
-
-            return False
-
-        except:
-            return False
 
     def _bulk_search_factors_with_lll(self, search_radius: int, pretrained_transformer: Optional['StepPredictionTransformer'] = None) -> Optional[Tuple[int, int]]:
         """
@@ -8364,14 +7981,15 @@ class MinimizableFactorizationLatticeSolver:
         Find the best factorization corrections using pyramid lattice reduction.
         """
         print(f"[Lattice] Using pyramid lattice for factorization corrections...")
-        print(f"[Lattice] Search radius parameter: {search_radius.bit_length()} bits")
+        print(f"[Lattice] Search radius parameter: {search_radius} ({search_radius.bit_length()} bits)")
         
-        # Skip LLL entirely - our massively expanded vectors already obey constraints
-        # Process the raw pyramid basis directly since vectors are constraint-compliant
-        print(f"[Lattice] Skipping LLL reduction - processing {len(pyramid_basis)} constraint-obeying vectors directly")
-        print(f"[Lattice] Vectors already cover 2^300 scale error range and satisfy polynomial constraints")
+        # For huge search radii, note that we'll extract corrections directly from LLL-reduced vectors
+        if search_radius > 10**100:
+            print(f"[Lattice] Large search radius detected - will extract corrections from LLL-reduced short vectors")
+            print(f"[Lattice] LLL reduction should produce vectors with small coefficients containing the corrections")
 
-        reduced_basis = pyramid_basis
+        # Minimize the lattice using LLL
+        reduced_basis = self._minimize_lattice(pyramid_basis)
 
         # Extract corrections from shortest vectors
         best_dp = 0
@@ -8383,14 +8001,31 @@ class MinimizableFactorizationLatticeSolver:
         print(f"[Lattice] Reduced basis has {len(reduced_basis)} vectors")
         print(f"[Lattice] Initial difference: {initial_diff} ({initial_diff.bit_length()} bits)")
 
-        # Process vectors in their original order - disregard shortness, focus on constraints
-        # For poor approximations, vector length is not as important as constraint satisfaction
-        print(f"[Lattice] Checking ALL {len(reduced_basis)} vectors from reduced basis (constraint-first approach)...")
-        print(f"[Lattice]    (Disregarding vector shortness - only considering constraint satisfaction)")
-        print(f"[Lattice]    (Poor approximations may have useful corrections in non-short vectors)")
-
-        # Process vectors in their original order from LLL reduction
+        # Sort vectors by their L2 norm (length) - check shortest vectors first
+        # This helps find the best corrections early
+        vector_norms = []
         for i, vector in enumerate(reduced_basis):
+            try:
+                # Compute L2 norm squared (avoid sqrt for large numbers)
+                norm_sq = sum(int(x)**2 for x in vector if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vector))
+            except:
+                # If norm computation fails, use index as fallback
+                vector_norms.append((float('inf'), i, vector))
+        
+        # Sort by norm (shortest first)
+        vector_norms.sort(key=lambda x: x[0])
+        
+        # Check ALL vectors from the reduced basis - don't limit
+        # For large numbers with poor approximations, we need to check all vectors
+        max_vectors_to_check = len(reduced_basis)
+        
+        print(f"[Lattice] Checking ALL {max_vectors_to_check} vectors from reduced basis (sorted by norm)...")
+        print(f"[Lattice]    (No limit - checking all vectors to maximize chance of finding corrections)")
+        
+        # Check vectors in order of increasing norm
+        for norm_sq, orig_idx, vector in vector_norms:
+            i = orig_idx  # Keep original index for reporting
             try:
                 # Extract coefficients (vector format: [a, b, c] represents a + b*dp + c*dq = 0)
                 # Where dp and dq are corrections: p = p_candidate + dp, q = q_candidate + dq
@@ -8443,14 +8078,11 @@ class MinimizableFactorizationLatticeSolver:
                 # We get: a + b*(p_candidate + dp) + c*(q_candidate + dq) = 0
                 # So: b*dp + c*dq = -a - b*p_candidate - c*q_candidate
 
-                # VECTOR CONSTRAINT ALREADY ENFORCED AT GENERATION TIME
-                # All vectors now satisfy p*q = N by construction - no additional checking needed
-
                 rhs = -a - b * p_candidate - c * q_candidate
                 
-                # Debug: log vector details for first few vectors that pass constraint
+                # Debug: log vector details for first few vectors
                 if i < 10:
-                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}, polynomial={vector_polynomial_value.bit_length()} bits (equals N: {vector_polynomial_value == self.N})")
+                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}")
 
                 if b != 0:
                     dp = rhs // b
@@ -9044,14 +8676,15 @@ class MinimizableFactorizationLatticeSolver:
         Find the best factorization corrections using pyramid lattice reduction.
         """
         print(f"[Lattice] Using pyramid lattice for factorization corrections...")
-        print(f"[Lattice] Search radius parameter: {search_radius.bit_length()} bits")
+        print(f"[Lattice] Search radius parameter: {search_radius} ({search_radius.bit_length()} bits)")
         
-        # Skip LLL entirely - our massively expanded vectors already obey constraints
-        # Process the raw pyramid basis directly since vectors are constraint-compliant
-        print(f"[Lattice] Skipping LLL reduction - processing {len(pyramid_basis)} constraint-obeying vectors directly")
-        print(f"[Lattice] Vectors already cover 2^300 scale error range and satisfy polynomial constraints")
+        # For huge search radii, note that we'll extract corrections directly from LLL-reduced vectors
+        if search_radius > 10**100:
+            print(f"[Lattice] Large search radius detected - will extract corrections from LLL-reduced short vectors")
+            print(f"[Lattice] LLL reduction should produce vectors with small coefficients containing the corrections")
 
-        reduced_basis = pyramid_basis
+        # Minimize the lattice using LLL
+        reduced_basis = self._minimize_lattice(pyramid_basis)
 
         # Extract corrections from shortest vectors
         best_dp = 0
@@ -9063,14 +8696,31 @@ class MinimizableFactorizationLatticeSolver:
         print(f"[Lattice] Reduced basis has {len(reduced_basis)} vectors")
         print(f"[Lattice] Initial difference: {initial_diff} ({initial_diff.bit_length()} bits)")
 
-        # Process vectors in their original order - disregard shortness, focus on constraints
-        # For poor approximations, vector length is not as important as constraint satisfaction
-        print(f"[Lattice] Checking ALL {len(reduced_basis)} vectors from reduced basis (constraint-first approach)...")
-        print(f"[Lattice]    (Disregarding vector shortness - only considering constraint satisfaction)")
-        print(f"[Lattice]    (Poor approximations may have useful corrections in non-short vectors)")
-
-        # Process vectors in their original order from LLL reduction
+        # Sort vectors by their L2 norm (length) - check shortest vectors first
+        # This helps find the best corrections early
+        vector_norms = []
         for i, vector in enumerate(reduced_basis):
+            try:
+                # Compute L2 norm squared (avoid sqrt for large numbers)
+                norm_sq = sum(int(x)**2 for x in vector if isinstance(x, (int, np.integer)))
+                vector_norms.append((norm_sq, i, vector))
+            except:
+                # If norm computation fails, use index as fallback
+                vector_norms.append((float('inf'), i, vector))
+        
+        # Sort by norm (shortest first)
+        vector_norms.sort(key=lambda x: x[0])
+        
+        # Check ALL vectors from the reduced basis - don't limit
+        # For large numbers with poor approximations, we need to check all vectors
+        max_vectors_to_check = len(reduced_basis)
+        
+        print(f"[Lattice] Checking ALL {max_vectors_to_check} vectors from reduced basis (sorted by norm)...")
+        print(f"[Lattice]    (No limit - checking all vectors to maximize chance of finding corrections)")
+        
+        # Check vectors in order of increasing norm
+        for norm_sq, orig_idx, vector in vector_norms:
+            i = orig_idx  # Keep original index for reporting
             try:
                 # Extract coefficients (vector format: [a, b, c] represents a + b*dp + c*dq = 0)
                 # Where dp and dq are corrections: p = p_candidate + dp, q = q_candidate + dq
@@ -9123,14 +8773,11 @@ class MinimizableFactorizationLatticeSolver:
                 # We get: a + b*(p_candidate + dp) + c*(q_candidate + dq) = 0
                 # So: b*dp + c*dq = -a - b*p_candidate - c*q_candidate
 
-                # VECTOR CONSTRAINT ALREADY ENFORCED AT GENERATION TIME
-                # All vectors now satisfy p*q = N by construction - no additional checking needed
-
                 rhs = -a - b * p_candidate - c * q_candidate
                 
-                # Debug: log vector details for first few vectors that pass constraint
+                # Debug: log vector details for first few vectors
                 if i < 10:
-                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}, polynomial={vector_polynomial_value.bit_length()} bits (equals N: {vector_polynomial_value == self.N})")
+                    print(f"[Lattice]   Vector {i}: a={a}, b={b}, c={c}, rhs={rhs}")
 
                 if b != 0:
                     dp = rhs // b
@@ -9275,7 +8922,7 @@ class MinimizableFactorizationLatticeSolver:
         if best_improvement < 0.01:
             print(f"[Lattice] Pyramid lattice found limited improvement ({best_improvement:.4f})")
             print(f"[Lattice] ⚠️  DIAGNOSIS:")
-            print(f"[Lattice]    - Checked {len(reduced_basis)} vectors from raw constraint-obeying basis")
+            print(f"[Lattice]    - Checked {len(vector_norms)} vectors from LLL-reduced basis")
             print(f"[Lattice]    - Initial difference: {initial_diff.bit_length()} bits ({initial_diff})")
             print(f"[Lattice]    - Search radius: {search_radius.bit_length()} bits")
             print(f"[Lattice]    - p_candidate: {p_candidate}")
@@ -11044,7 +10691,7 @@ class MinimizableFactorizationLatticeSolver:
         print(f"[LATTICE SOLVER] ⭐ Minimizable Factorization Lattice")
         print(f"{'─'*80}")
         print(f"[Lattice] Input candidates: p={p_candidate}, q={q_candidate}")
-        print(f"[Lattice] Search radius: {search_radius.bit_length()} bits (2^{search_radius.bit_length()})")
+        print(f"[Lattice] Search radius: {search_radius}")
         
         # Check initial approximation quality
         initial_product = p_candidate * q_candidate
@@ -11053,9 +10700,6 @@ class MinimizableFactorizationLatticeSolver:
         print(f"[Lattice] Initial approximation quality:")
         print(f"[Lattice]   p_candidate × q_candidate = {initial_product}")
         print(f"[Lattice]   Difference from N: {initial_diff} ({initial_diff_bits} bits)")
-
-        # Initialize improvement
-        improvement = 0.0
         
         # Warn if initial difference is too large relative to search radius
         if initial_diff_bits > search_radius.bit_length() + 100:
@@ -11134,8 +10778,7 @@ class MinimizableFactorizationLatticeSolver:
         # If initial difference is larger than search radius, expand search radius
         if initial_diff_bits > search_radius_bits:
             # Expand to at least 2x the initial difference (with some margin)
-            expanded_radius_bits = initial_diff_bits + 200  # Expand to cover full error term + margin
-            search_radius = 2 ** expanded_radius_bits  # Actually update the search radius!
+            expanded_radius_bits = initial_diff_bits + 100  # Add 100 bits of margin
             expanded_radius = 2 ** expanded_radius_bits
             print(f"[Lattice] 🔧 Expanding search radius: {search_radius_bits} bits → {expanded_radius_bits} bits")
             print(f"[Lattice]    (Initial difference: {initial_diff_bits} bits, need larger radius)")
@@ -11297,11 +10940,7 @@ class MinimizableFactorizationLatticeSolver:
             return refined_p, refined_q, improvement, pyramid_basis
         else:
             print(f"[Lattice] No significant improvement")
-            print(f"[Lattice] Returning best approximation found")
-            final_product = refined_p * refined_q
-            final_diff = abs(final_product - self.N)
-            print(f"[Lattice] Best approximation: p×q = {final_product.bit_length()} bits, error = {final_diff.bit_length()} bits")
-            return refined_p, refined_q, improvement, pyramid_basis
+            return None, None, 0.0, pyramid_basis
 
     def generate_factorization_polynomials(self, p_candidate: int, q_candidate: int,
                                          lattice_basis: np.ndarray = None,
@@ -12259,9 +11898,6 @@ def pretrain_transformer(transformer: StepPredictionTransformer, num_keys: int, 
 
 
 def main():
-    # Set maximum string digits for large integers (handles 2^20000+)
-    sys.set_int_max_str_digits(100000)
-
     parser = argparse.ArgumentParser(
         description="Standalone Minimizable Factorization Lattice Attack with Enhanced Polynomial Solving",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -12940,20 +12576,21 @@ def main():
         else:
             # Direct value
             search_radius = args.search_radius
-            print(f"🔧 Using search radius: {search_radius} (2^{search_radius.bit_length()} bits)")
+            print(f"🔧 Using search radius: {search_radius}")
     else:
         # Default: 2^4000 (huge but fine for LLL - we're finding short vectors, not brute forcing)
         search_radius = DEFAULT_SEARCH_RADIUS
         print(f"🔧 Using default search radius: 2^{DEFAULT_SEARCH_RADIUS_BITS} = {search_radius.bit_length()} bits")
         print(f"    (LLL finds short vectors efficiently, so large radius is fine)")
     
-    # Push to maximum: expand search radius to 2048 bits (full N range) for ultimate coverage
+    # Auto-expand if initial difference is larger than search radius (shouldn't happen with 2^4000 default)
     search_radius_bits = search_radius.bit_length() if search_radius > 0 else 0
-    # Expand to maximum possible: cover up to N.bit_length() (2048 bits)
-    expanded_bits = max(search_radius_bits, self.N.bit_length())
-    search_radius = 2 ** expanded_bits
-    print(f"🔧 Search radius PUSHED to maximum: {search_radius_bits} bits → {expanded_bits} bits (full N range)")
-    print(f"    (Error term: {initial_diff_bits} bits, maximum coverage: {expanded_bits} bits)")
+    if initial_diff_bits > search_radius_bits:
+        # Expand to initial_diff_bits + 100 bits margin
+        expanded_bits = initial_diff_bits + 100
+        search_radius = 2 ** expanded_bits
+        print(f"🔧 Auto-expanding search radius: {search_radius_bits} bits → {expanded_bits} bits")
+        print(f"    (Initial difference: {initial_diff_bits} bits, need larger radius)")
 
     # Run lattice attack
     refined_p, refined_q, improvement, pyramid_basis = lattice_solver.solve(
