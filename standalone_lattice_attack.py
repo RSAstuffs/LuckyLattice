@@ -8,7 +8,7 @@ with advanced polynomial solving capabilities.
 Usage:
     python standalone_lattice_attack.py <N> [--p P] [--q Q] [--search-radius RADIUS] [--verbose] [--polynomial]
     python standalone_lattice_attack.py --train-s-values [--save-pretrained MODEL] [--load-training-data DATA]
-    python standalone_lattice_attack.py --train-s-only 2048 --save-training s_training.json
+    python standalone_lattice_attack.py --train-s-only 100 --train-s-bits 1024 --save-training s_training.json
     python standalone_lattice_attack.py <N> --sfactor --load-training s_training.json
     python standalone_lattice_attack.py --save-training data.json --load-training data.json
     python standalone_lattice_attack.py --clear-training
@@ -975,26 +975,24 @@ class StepPredictionTransformer:
             predicted_S = 2 * sqrt_N
             return predicted_S, 0.2
 
-        # Weighted prediction based on similar cases
-        total_weight = 0
-        weighted_sum = 0
-        max_confidence = 0
+        # Use the best matching sample and scale it to target size
+        # This avoids complex weighted calculations with large integers
 
-        for sample, weight in similar_cases[:10]:  # Use top 10 similar cases
-            # Adjust prediction based on N ratio
-            N_ratio = N / sample['N']
-            adjusted_S = int(sample['true_S'] * math.sqrt(float(N_ratio)))  # Convert to float for sqrt
+        best_sample = similar_cases[0][0]  # Best match (highest similarity)
+        best_weight = similar_cases[0][1]
 
-            weighted_sum += adjusted_S * weight * sample['confidence']
-            total_weight += weight * sample['confidence']
-            max_confidence = max(max_confidence, sample['confidence'])
+        # Scale S value based on sqrt(N) ratio using integer arithmetic
+        sqrt_N_target = math.isqrt(N)
+        sqrt_N_sample = math.isqrt(best_sample['N'])
 
-        if total_weight > 0:
-            predicted_S = int(weighted_sum / total_weight)
-            confidence = min(max_confidence * 0.8, 0.9)  # Slightly reduce confidence for prediction
+        if sqrt_N_sample > 0 and sqrt_N_target > 0:
+            # predicted_S = best_sample['true_S'] * (sqrt_N_target / sqrt_N_sample)
+            predicted_S = (best_sample['true_S'] * sqrt_N_target) // sqrt_N_sample
         else:
-            predicted_S = 2 * sqrt_N
-            confidence = 0.1
+            predicted_S = 2 * sqrt_N  # Fallback
+
+        # Confidence based on similarity and sample confidence
+        confidence = min(best_sample['confidence'] * best_weight, 0.8)
 
         return predicted_S, confidence
 
@@ -12409,6 +12407,8 @@ def main():
                        help="Enable training on S values (p+q sums) for factorization prediction")
     parser.add_argument("--train-s-only", type=int, default=None,
                        help="Train ONLY on S values using S² factoring approach (specify number of RSA keys to generate, e.g., 2048)")
+    parser.add_argument("--train-s-bits", type=int, default=512,
+                       help="Bit length for S-training RSA keys (default: 512, should match target number scale)")
     parser.add_argument("--sfactor", action="store_true",
                        help="Use S² factoring with transformer S-value predictions (requires loaded S training data)")
     parser.add_argument("--save-training", type=str, default=None,
@@ -12655,7 +12655,7 @@ def main():
             print(f"\n🔢 S² Training key {i+1}/{s_training_keys}")
 
             # Generate RSA key
-            N, true_p, true_q = generate_training_rsa_key(512)  # Medium size for S training
+            N, true_p, true_q = generate_training_rsa_key(args.train_s_bits)
             true_S = true_p + true_q
             sqrt_N = int(math.isqrt(N))
 
