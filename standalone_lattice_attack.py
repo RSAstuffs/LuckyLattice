@@ -69,8 +69,9 @@ class StepPredictionTransformer:
         self.nhead = nhead
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
-        self.search_history = []  # List of (step_center, diff_bits, sqrt_N, N_bits)
+        self.search_history = []  # List of feature vectors (8 features each)
         self.factor_history = []  # List of (step_center, p_candidate, q_candidate, diff_bits) for learning p-q patterns
+        self._timestamps = []     # Separate timestamp storage for sorting
         
         if self.use_torch:
             self._init_torch_model(d_model, nhead, num_layers)
@@ -237,8 +238,8 @@ class StepPredictionTransformer:
 
         # Recency feature (how recent is this result?)
         recency = 1.0  # Most recent result
-        if self.search_history:
-            time_diff = current_time - self.search_history[-1][-1]  # Compare to last result timestamp
+        if self._timestamps:
+            time_diff = current_time - self._timestamps[-1]  # Compare to last result timestamp
             recency = min(1.0, 1.0 / (1.0 + time_diff))  # Exponential decay
 
         # Quality trend feature (is quality improving?)
@@ -282,9 +283,10 @@ class StepPredictionTransformer:
             recency,
             quality_trend,
             correction_signal,     # Correction signal from known factors
-            optimality_score,      # How close to optimal factor locations
-            current_time  # Add timestamp for recency calculations
+            optimality_score       # How close to optimal factor locations
         ))
+        # Keep timestamp separate for sorting (not used in neural features)
+        self._timestamps.append(current_time)
 
         # Enhanced p-q pattern learning with more features
         if p_candidate is not None and q_candidate is not None:
@@ -811,6 +813,7 @@ class StepPredictionTransformer:
                 'optimizer_state': self.optimizer.state_dict(),
                 'search_history': self.search_history,
                 'factor_history': self.factor_history,
+                'timestamps': self._timestamps,  # Save timestamps separately
                 'pretrained': getattr(self, 'pretrained', False),
                 'config': {
                     'd_model': self.d_model,
@@ -849,6 +852,7 @@ class StepPredictionTransformer:
             # Restore learning history
             self.search_history = state.get('search_history', [])
             self.factor_history = state.get('factor_history', [])
+            self._timestamps = state.get('timestamps', [])
             self.pretrained = state.get('pretrained', False)
 
             print(f"[Transformer] ✅ Model loaded from {filepath}")
@@ -7607,7 +7611,12 @@ class MinimizableFactorizationLatticeSolver:
             step_num += 1
 
             # Progressive learning: transformer guides search from step 3 onward
-            if use_transformer and len(transformer.factor_history) >= 3:
+            # Use search_history for general knowledge, factor_history for current session progress
+            has_general_knowledge = len(transformer.search_history) >= 10  # Pre-trained knowledge
+            has_current_progress = len(transformer.factor_history) >= 3    # Current session progress
+            use_transformer_now = use_transformer and (has_general_knowledge or has_current_progress)
+
+            if use_transformer_now:
                 # Use Transformer to predict next promising position
                 # The transformer now learns progressively from ALL previous steps!
                 step_center = transformer.predict_next_search_position(
@@ -7622,9 +7631,16 @@ class MinimizableFactorizationLatticeSolver:
                 except (ValueError, OverflowError):
                     pos_str = f"{step_center}"
 
-                # Show transformer confidence and learning progress
-                history_size = len(transformer.factor_history)
-                print(f"\n[Transformer] Step {step_num}: Learned from {history_size} previous results")
+                        # Show transformer confidence and learning progress
+                search_history_size = len(transformer.search_history)
+                factor_history_size = len(transformer.factor_history)
+                total_knowledge = search_history_size + factor_history_size
+
+                if hasattr(transformer, 'pretrained') and transformer.pretrained:
+                    print(f"\n[Transformer] Step {step_num}: Using pre-trained knowledge ({search_history_size} general + {factor_history_size} current = {total_knowledge} total)")
+                else:
+                    print(f"\n[Transformer] Step {step_num}: Learned from {total_knowledge} previous results")
+
                 print(f"[Transformer] Predicted next position: {pos_str}")
 
                 # Occasionally add some exploration even when using transformer
